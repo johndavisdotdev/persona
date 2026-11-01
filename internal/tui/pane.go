@@ -8,7 +8,6 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/johndavisdev/persona/internal/docker"
 	"github.com/johndavisdev/persona/internal/persona"
 )
 
@@ -61,7 +60,7 @@ func capture(ctx context.Context, id int, container string) tea.Cmd {
 		cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		script := `tmux display -p -t ` + persona.SessionName + ` '#{cursor_x} #{cursor_y}' && printf '` + sep + `' && tmux capture-pane -p -e -N -t ` + persona.SessionName
-		out, err := docker.Exec(cctx, container, "sh", "-c", script)
+		out, err := rt.Exec(cctx, container, "sh", "-c", script)
 		if err != nil {
 			return captureMsg{pane: id, err: err}
 		}
@@ -138,7 +137,7 @@ func (s *sender) run(ctx context.Context, container string, it sendItem) {
 	default:
 		args = append(args, "send-keys", "-t", persona.SessionName, it.keys)
 	}
-	_, _ = docker.Exec(cctx, container, args...)
+	_, _ = rt.Exec(cctx, container, args...)
 }
 
 func (s *sender) send(it sendItem) {

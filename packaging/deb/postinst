@@ -1,0 +1,37 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = configure ]; then
+	getent group persona-vm >/dev/null || addgroup --quiet --system persona-vm
+	visudo -cqf /etc/sudoers.d/persona-vm || {
+		echo "persona: /etc/sudoers.d/persona-vm is invalid; fix it before using microVMs" >&2
+	}
+	install -d -o root -g root -m 0755 /srv/jailer
+	modprobe tun 2>/dev/null || true
+
+	# The user who ran sudo apt install gets access right away.
+	added=""
+	if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && getent passwd "$SUDO_USER" >/dev/null; then
+		for g in persona-vm kvm; do
+			getent group "$g" >/dev/null || continue
+			id -nG "$SUDO_USER" | tr ' ' '\n' | grep -qx "$g" && continue
+			adduser --quiet "$SUDO_USER" "$g"
+			added="$SUDO_USER"
+		done
+	fi
+
+	if [ -d /run/systemd/system ]; then
+		systemctl daemon-reload
+		systemctl enable persona-netns.service >/dev/null 2>&1 || true
+		systemctl restart persona-netns.service || echo "persona: persona-netns.service failed to start; see: journalctl -u persona-netns" >&2
+	fi
+
+	[ -e /dev/kvm ] || echo "persona: /dev/kvm is missing; microVMs need KVM (enable virtualization, or set runtime: docker)" >&2
+	if [ -n "$added" ]; then
+		echo "persona: added $added to the persona-vm and kvm groups (sudo checks persona-vm right away)."
+	elif [ -z "${SUDO_USER:-}" ] || [ "$SUDO_USER" = root ]; then
+		echo "persona: to use microVMs, add yourself to persona-vm: sudo adduser \$USER persona-vm"
+	fi
+fi
+
+exit 0

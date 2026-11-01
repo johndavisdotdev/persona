@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/johndavisdev/persona/internal/docker"
+	"github.com/johndavisdev/persona/internal/instance"
 	"github.com/johndavisdev/persona/internal/persona"
 	"github.com/johndavisdev/persona/internal/ui"
 )
@@ -24,27 +25,29 @@ func newListCmd() *cobra.Command {
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, out := cmd.Context(), cmd.OutOrStdout()
-			var cs []docker.Container
+			var cs []instance.Container
 			dockerErr := docker.Available(ctx)
-			if dockerErr == nil {
+			rt := instance.Current()
+			rtErr := rt.Available(ctx)
+			if rtErr == nil {
 				var err error
-				if cs, err = docker.List(ctx, ""); err != nil {
+				if cs, err = rt.List(ctx, ""); err != nil {
 					return err
 				}
 			}
 
 			if instances {
-				if dockerErr != nil {
-					return dockerErr
+				if rtErr != nil {
+					return rtErr
 				}
 				if asJSON {
 					return json.NewEncoder(out).Encode(cs)
 				}
 				if len(cs) == 0 {
-					fmt.Fprintln(out, ui.Dim.Render("No persona containers. Start one with `persona spawn <persona>`."))
+					fmt.Fprintln(out, ui.Dim.Render("No persona instances. Start one with `persona spawn <persona>`."))
 					return nil
 				}
-				t := newTable("CONTAINER", "PERSONA", "STATE", "STATUS")
+				t := newTable("INSTANCE", "PERSONA", "STATE", "STATUS")
 				for _, c := range cs {
 					state := c.State
 					if c.Running() {

@@ -12,6 +12,8 @@ persona control-center           # TUI: split panes + tabs across running person
 ## Requirements
 
 - Docker (Docker Desktop, OrbStack, Colima, …) with BuildKit (the default)
+- On Linux, KVM and the persona `.deb` for the default [microVM runtime](#microvm-runtime-linux),
+  or `runtime: docker` to use containers instead
 - `ANTHROPIC_API_KEY`, used by the persona designer and forwarded into containers.
   You can use `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` for the containers instead.
 - Optional: `EXA_API_KEY` lets the designer search the web for niche third-party marketplaces and MCP servers.
@@ -82,6 +84,58 @@ The sidebar lists personas and their containers. Each pane mirrors a container's
 Panes talk to containers only through the `docker` CLI (`tmux capture-pane` / `send-keys`), so the TUI needs no PTY
 layer and behaves the same on macOS, Linux, and Windows.
 
+## MicroVM runtime (Linux)
+
+On Linux, instances run as [Firecracker](https://firecracker-microvm.github.io/) microVMs by default, which needs KVM
+and the host setup below. On macOS and Windows the default is Docker containers. To use containers on Linux, set
+`runtime: docker` in `config.yaml` (or `PERSONA_RUNTIME=docker`). Every command works the same way on both
+runtimes, and images are always built with Docker.
+
+**Install** on Debian 13 (trixie) or later, x86_64, with one package:
+
+```sh
+make deb                                   # builds dist/persona_<version>_amd64.deb
+sudo apt install ./dist/persona_*_amd64.deb
+```
+
+`make host-setup` does both. The package contains:
+
+| Path | What |
+|---|---|
+| `/usr/bin/persona` | the CLI (and, copied into images, the guest agent) |
+| `/usr/libexec/persona/firecracker`, `jailer` | Firecracker (version set by `FC_VERSION` at build time) |
+| `/usr/libexec/persona/persona-vm` | the root wrapper: the only thing persona runs as root |
+| `/usr/libexec/persona/persona-netns` | sets up the shared network namespace, run by `persona-netns.service` |
+| `/usr/share/persona/vmlinux` | guest kernel (Firecracker CI build, or `KERNEL=/path` at build time) |
+| `/etc/sudoers.d/persona-vm` | lets the `persona-vm` group run the wrapper, and nothing else |
+
+Installing it creates the `persona-vm` group and adds the user who ran `sudo apt install` to it (and to `kvm`). It
+also starts the network service. Docker is recommended rather than required, since it's only needed to build images.
+`apt remove` stops all microVMs and the network service.
+
+**Isolation.** Each VM runs under the jailer: in a chroot, as its own uid. All VMs share one bridge, so instances can
+reach each other. Traffic leaving the bridge is NATed to the internet. The host itself, and every private, link-local
+and CGNAT address range (your LAN), is unreachable from the VMs. DNS uses public resolvers for that reason.
+
+**Workspaces.** Spawned inside a git repository, an instance gets its own branch, `persona/<instance>`, starting from
+your current `HEAD`, plus a worktree for that branch under `$PERSONA_HOME/worktrees`. The VM receives a single-branch
+clone of it, so none of your other branches and none of your `.git` reach the VM. Uncommitted changes in your checkout
+are not copied. Outside a repository, the directory is copied in.
+
+**Pushing without credentials.** VMs never get your SSH keys or GitHub tokens. Instead, Claude Code runs
+`persona-agent push`, or `persona-agent pr --title … --body …`. A broker on the host, started on demand, receives the
+branch as a git bundle, verifies it, and fast-forwards the worktree. It then pushes with your own `git` (and opens the
+PR with your own `gh`). It only ever pushes the instance's own branch.
+
+**Stopping** saves everything. Commits land on the branch, and uncommitted changes are copied into the worktree
+(files ignored by `.gitignore` are skipped). Removing the instance deletes the worktree only if it is clean; the branch
+is always kept. `persona stop --force` skips saving, for a VM that no longer responds.
+
+Each VM's root filesystem is the image, flattened to a read-only disk that every instance of that persona shares. A
+small, per-VM disk is layered over it with overlayfs. The guest's init is `persona-agent`: the persona binary itself,
+copied into the image. Over vsock it handles identity, file delivery (secrets go to tmpfs only), file transfer and
+terminals.
+
 ## Configuration
 
 Output is styled when it goes to a terminal. Set `NO_COLOR=1` or pass `--no-color` to turn styling off (this applies
@@ -100,4 +154,9 @@ marketplaces:                     # built-in marketplaces the designer always se
 base_image: debian:trixie-slim
 forward_env: [ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN]
 editor: "code --wait"
+runtime: firecracker              # default on Linux; docker elsewhere (see MicroVM runtime)
+vm_kernel: /usr/local/share/persona/vmlinux
+vm_vcpus: 2
+vm_memory_mib: 4096
+vm_disk_gib: 32                   # each VM's writable layer (sparse)
 ```

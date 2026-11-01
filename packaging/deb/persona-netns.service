@@ -1,0 +1,14 @@
+[Unit]
+Description=Shared network namespace and NAT for persona Firecracker microVMs
+Wants=network-online.target
+# Start after the services that rewrite iptables so our chains are jumped to first.
+After=network-online.target docker.service ufw.service pve-firewall.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/persona/persona-netns up
+ExecStop=/usr/libexec/persona/persona-netns down
+
+[Install]
+WantedBy=multi-user.target

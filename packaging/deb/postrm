@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+remove)
+	[ -d /run/systemd/system ] && systemctl daemon-reload || true
+	;;
+purge)
+	# Leave the persona-vm group (other files may be owned by it) and any user data.
+	rm -rf /srv/jailer/persona-state /srv/jailer/persona-users
+	rmdir /srv/jailer/firecracker /srv/jailer 2>/dev/null || true
+	;;
+esac
+
+exit 0

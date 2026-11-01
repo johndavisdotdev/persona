@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/spf13/viper"
 )
@@ -22,6 +23,14 @@ const (
 	KeyEditor          = "editor"
 	KeyDockerBin       = "docker"
 	KeyForwardEnv      = "forward_env"
+	// KeyRuntime selects where instances run: "firecracker" (microVMs; the
+	// default on Linux, needs KVM and the persona .deb) or "docker"
+	// (containers; the default elsewhere).
+	KeyRuntime  = "runtime"
+	KeyVMKernel = "vm_kernel" // guest kernel (uncompressed vmlinux)
+	KeyVMVCPUs  = "vm_vcpus"
+	KeyVMMemory = "vm_memory_mib"
+	KeyVMDisk   = "vm_disk_gib" // size of each VM's writable layer (sparse)
 )
 
 // DefaultMarketplaces are the built-in marketplaces the AI always searches.
@@ -48,6 +57,11 @@ func Init(cfgFile, home string) error {
 	viper.SetDefault(KeyBaseImage, "debian:trixie-slim")
 	viper.SetDefault(KeyDockerBin, "docker")
 	viper.SetDefault(KeyForwardEnv, []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"})
+	viper.SetDefault(KeyRuntime, DefaultRuntime())
+	viper.SetDefault(KeyVMKernel, "/usr/share/persona/vmlinux")
+	viper.SetDefault(KeyVMVCPUs, 2)
+	viper.SetDefault(KeyVMMemory, 4096)
+	viper.SetDefault(KeyVMDisk, 32)
 
 	// Fall back to the conventional, unprefixed env vars for API keys.
 	_ = viper.BindEnv(KeyAnthropicAPIKey, "PERSONA_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")
@@ -83,6 +97,25 @@ func Home() string { return viper.GetString(KeyHome) }
 
 // PersonasDir holds one subdirectory per persona.
 func PersonasDir() string { return filepath.Join(Home(), "personas") }
+
+// DefaultRuntime is firecracker on Linux, where microVMs can run, and docker
+// everywhere else.
+func DefaultRuntime() string {
+	if runtime.GOOS == "linux" {
+		return "firecracker"
+	}
+	return "docker"
+}
+
+// InstancesDir holds one record per microVM instance.
+func InstancesDir() string { return filepath.Join(Home(), "instances") }
+
+// VMDir holds microVM images and the blank overlay disk. It should be on the
+// same filesystem as /srv/jailer so VMs can share images by hard link.
+func VMDir() string { return filepath.Join(Home(), "vm") }
+
+// WorktreesDir holds one git worktree per microVM instance.
+func WorktreesDir() string { return filepath.Join(Home(), "worktrees") }
 
 // CacheDir holds cached marketplace manifests.
 func CacheDir() string { return filepath.Join(Home(), "cache") }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/johndavisdev/persona/internal/config"
 	"github.com/johndavisdev/persona/internal/docker"
+	"github.com/johndavisdev/persona/internal/instance"
 	"github.com/johndavisdev/persona/internal/persona"
 	"github.com/johndavisdev/persona/internal/persona/naming"
 	"github.com/johndavisdev/persona/internal/ui"
@@ -37,7 +38,8 @@ func Spawn(ctx context.Context, name string, o SpawnOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := docker.Available(ctx); err != nil {
+	rt := instance.Current()
+	if err := rt.Available(ctx); err != nil {
 		return "", err
 	}
 	log := o.Log
@@ -87,9 +89,9 @@ func Spawn(ctx context.Context, name string, o SpawnOptions) (string, error) {
 	if o.SkipPermissions {
 		claudeArgs = "--dangerously-skip-permissions"
 	}
-	return docker.Run(ctx, docker.RunOptions{
+	return rt.Run(ctx, instance.RunOptions{
 		Persona: p.Name, Instance: inst, Workdir: workdir, Env: env,
-		ClaudeArgs: claudeArgs, Prompt: o.Prompt, Cols: o.Cols, Rows: o.Rows,
+		ClaudeArgs: claudeArgs, Prompt: o.Prompt, Cols: o.Cols, Rows: o.Rows, Log: log,
 	})
 }
 
@@ -98,12 +100,21 @@ func newSpawnCmd() *cobra.Command {
 	var attach bool
 	cmd := &cobra.Command{
 		Use:   "spawn <persona>",
-		Short: "Spawn a container running Claude Code as the given persona",
-		Long: `Starts a detached container from the persona's image (building it first if
+		Short: "Spawn an instance running Claude Code as the given persona",
+		Long: `Starts a detached instance from the persona's image (building it first if
 needed). Claude Code runs inside a tmux session; attach with --attach,
-` + "`persona join`" + `, or the control center. The current directory is mounted at
-/workspace unless --workdir or --no-mount is given. ANTHROPIC_API_KEY,
-CLAUDE_CODE_OAUTH_TOKEN, and the persona's declared env vars are forwarded.`,
+` + "`persona join`" + `, or the control center. ANTHROPIC_API_KEY,
+CLAUDE_CODE_OAUTH_TOKEN, and the persona's declared env vars are forwarded.
+
+On Linux the default runtime is firecracker, and the instance is a microVM.
+Inside a git repository it gets its own branch, persona/<instance>, with a
+worktree under $PERSONA_HOME/worktrees and a copy in the VM. Claude Code
+pushes and opens pull requests through a broker on the host, so no
+credentials enter the VM. Stopping it saves its work to the worktree. Outside
+a repository the directory is copied in and back out.
+
+With the docker runtime (the default off Linux, or runtime: docker), the
+current directory (or --workdir) is mounted at /workspace instead.`,
 		Example: `  persona spawn reviewer -a
   persona spawn data-eng --workdir ~/src/warehouse --prompt "audit the dbt models"
   persona spawn researcher --no-mount --name scratch`,
@@ -143,7 +154,7 @@ func attachTo(ctx context.Context, container string, out io.Writer) error {
 		return err
 	}
 	fmt.Fprintln(out, ui.Dim.Render("Attaching to "+container+" — detach with Ctrl-b d"))
-	err := docker.AttachCommand(ctx, container).Run()
+	err := instance.Current().AttachCommand(ctx, container).Run()
 	var exitErr interface{ ExitCode() int }
 	if errors.As(err, &exitErr) && ctx.Err() == nil {
 		return nil // tmux exits non-zero on some detaches; not a user-facing error

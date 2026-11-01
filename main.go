@@ -1,4 +1,5 @@
-// Command persona builds, spawns, and multiplexes containerized Claude Code personas.
+// Command persona builds, spawns, and multiplexes Claude Code personas, as
+// containers or as Firecracker microVMs.
 package main
 
 import (
@@ -6,6 +7,7 @@ import (
 	"os"
 
 	"github.com/johndavisdev/persona/cmd"
+	"github.com/johndavisdev/persona/internal/agent/guest"
 	"github.com/johndavisdev/persona/internal/persona"
 )
 
@@ -16,6 +18,10 @@ import (
 var baseSettings []byte
 
 func main() {
+	// Inside a microVM this binary is /sbin/persona-agent: init and guest CLI.
+	if guest.IsAgent() {
+		guest.Main()
+	}
 	persona.DefaultBaseSettings = baseSettings
 	os.Exit(cmd.Execute())
 }

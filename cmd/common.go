@@ -15,6 +15,7 @@ import (
 	"github.com/johndavisdev/persona/internal/ai"
 	"github.com/johndavisdev/persona/internal/config"
 	"github.com/johndavisdev/persona/internal/docker"
+	"github.com/johndavisdev/persona/internal/instance"
 	"github.com/johndavisdev/persona/internal/persona"
 	"github.com/johndavisdev/persona/internal/ui"
 )
@@ -100,7 +101,7 @@ func completeContainers(cmd *cobra.Command, _ []string, _ string) ([]string, cob
 	if err := config.Init(cfgFile, ""); err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
-	cs, _ := docker.List(cmd.Context(), "")
+	cs, _ := instance.Current().List(cmd.Context(), "")
 	var out []string
 	for _, c := range cs {
 		out = append(out, c.Name+"\t"+c.Persona+" ("+c.State+")")
@@ -108,20 +109,21 @@ func completeContainers(cmd *cobra.Command, _ []string, _ string) ([]string, cob
 	return out, cobra.ShellCompDirectiveNoFileComp
 }
 
-// pickContainer resolves a reference to exactly one container, prompting if needed.
-func pickContainer(ctx context.Context, ref string, runningOnly bool) (docker.Container, error) {
-	var cs []docker.Container
+// pickContainer resolves a reference to exactly one instance, prompting if needed.
+func pickContainer(ctx context.Context, ref string, runningOnly bool) (instance.Container, error) {
+	rt := instance.Current()
+	var cs []instance.Container
 	var err error
 	if ref == "" {
-		cs, err = docker.List(ctx, "")
+		cs, err = rt.List(ctx, "")
 	} else {
-		cs, err = docker.Resolve(ctx, ref)
+		cs, err = instance.Resolve(ctx, rt, ref)
 	}
 	if err != nil {
-		return docker.Container{}, err
+		return instance.Container{}, err
 	}
 	if runningOnly {
-		var r []docker.Container
+		var r []instance.Container
 		for _, c := range cs {
 			if c.Running() {
 				r = append(r, c)
@@ -131,7 +133,7 @@ func pickContainer(ctx context.Context, ref string, runningOnly bool) (docker.Co
 	}
 	switch {
 	case len(cs) == 0:
-		return docker.Container{}, fmt.Errorf("%w: nothing running (start one with `persona spawn <persona>`)", docker.ErrNoMatch)
+		return instance.Container{}, fmt.Errorf("%w: nothing running (start one with `persona spawn <persona>`)", instance.ErrNoMatch)
 	case len(cs) == 1:
 		return cs[0], nil
 	case !ui.Interactive():
@@ -139,36 +141,41 @@ func pickContainer(ctx context.Context, ref string, runningOnly bool) (docker.Co
 		for _, c := range cs {
 			names = append(names, c.Name)
 		}
-		return docker.Container{}, fmt.Errorf("%q matches several containers, pick one: %s", ref, strings.Join(names, ", "))
+		return instance.Container{}, fmt.Errorf("%q matches several instances, pick one: %s", ref, strings.Join(names, ", "))
 	}
 	var opts []huh.Option[string]
 	for _, c := range cs {
 		opts = append(opts, huh.NewOption(fmt.Sprintf("%s  (%s)", c.Name, c.Status), c.Name))
 	}
 	var chosen string
-	if err := huh.NewSelect[string]().Title("Which container?").Options(opts...).Value(&chosen).Run(); err != nil {
+	if err := huh.NewSelect[string]().Title("Which instance?").Options(opts...).Value(&chosen).Run(); err != nil {
 		if errors.Is(err, huh.ErrUserAborted) {
-			return docker.Container{}, context.Canceled
+			return instance.Container{}, context.Canceled
 		}
-		return docker.Container{}, err
+		return instance.Container{}, err
 	}
 	for _, c := range cs {
 		if c.Name == chosen {
 			return c, nil
 		}
 	}
-	return docker.Container{}, docker.ErrNoMatch
+	return instance.Container{}, instance.ErrNoMatch
 }
 
-// waitForSession waits until Claude Code's tmux session exists in the container.
+// waitForSession waits until Claude Code's tmux session exists in the instance.
 func waitForSession(ctx context.Context, container string, timeout time.Duration) error {
+	rt := instance.Current()
 	deadline := time.Now().Add(timeout)
 	for {
-		if _, err := docker.Exec(ctx, container, "tmux", "has-session", "-t", persona.SessionName); err == nil {
+		if _, err := rt.Exec(ctx, container, "tmux", "has-session", "-t", persona.SessionName); err == nil {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for the Claude Code session in %s (check `docker logs %s`)", container, container)
+			hint := "check `docker logs " + container + "`"
+			if rt.Name() != "docker" {
+				hint = "the VM console log is under /srv/jailer/persona-users"
+			}
+			return fmt.Errorf("timed out waiting for the Claude Code session in %s (%s)", container, hint)
 		}
 		select {
 		case <-ctx.Done():

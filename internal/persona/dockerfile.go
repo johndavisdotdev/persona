@@ -176,7 +176,8 @@ func renderDockerfile(p *Persona) (string, error) {
 		base = viper.GetString(config.KeyBaseImage)
 	}
 
-	apt := []string{"ca-certificates", "curl", "git", "jq", "less", "procps", "ripgrep", "tmux"}
+	// rsync copies workspaces into microVM instances.
+	apt := []string{"ca-certificates", "curl", "git", "jq", "less", "procps", "ripgrep", "rsync", "tmux"}
 	needsUV := false
 	for _, s := range p.MCPServers {
 		switch path.Base(s.Command) {

@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# persona-netns: shared network namespace for persona microVMs.
+# Installed as /usr/libexec/persona/persona-netns and run by persona-netns.service.
+#
+# Every microVM's tap device lives in one netns ("persona") on one bridge, so
+# VMs reach each other directly. Egress leaves through a veth pair to the host,
+# which NATs it out of the uplink. The host drops anything from the VMs that is
+# addressed to the host itself or to private/link-local/CGNAT ranges, so VMs
+# get the internet but no other machine on the local network.
+#
+#   persona-netns up                 create/repair everything (idempotent)
+#   persona-netns down               remove everything
+#   persona-netns status
+set -euo pipefail
+
+NS=${PERSONA_NETNS:-persona}
+BR=fcbr0
+VM_CIDR=10.200.0.0/16
+BR_ADDR=10.200.0.1/16
+HOST_VETH=fc-host0
+NS_VETH=fc-ns0
+HOST_VETH_ADDR=10.199.0.1/30
+NS_VETH_ADDR=10.199.0.2/30
+HOST_VETH_IP=${HOST_VETH_ADDR%/*}
+NS_VETH_IP=${NS_VETH_ADDR%/*}
+UPLINK=${PERSONA_UPLINK:-$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}
+
+# Destinations VMs may never reach: the local network and everything else non-public.
+BLOCKED=(0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12
+  192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4)
+
+IPT=${IPTABLES:-iptables}
+IP6T=${IP6TABLES:-ip6tables}
+nsx() { ip netns exec "$NS" "$@"; }
+
+# ensure_chain BIN TABLE PARENT CHAIN: CHAIN exists, is flushed, and is jumped to first from PARENT.
+ensure_chain() {
+  local bin=$1 table=$2 parent=$3 chain=$4
+  "$bin" -t "$table" -N "$chain" 2>/dev/null || "$bin" -t "$table" -F "$chain"
+  while "$bin" -t "$table" -D "$parent" -j "$chain" 2>/dev/null; do :; done
+  "$bin" -t "$table" -I "$parent" 1 -j "$chain"
+}
+
+drop_chain() {
+  local bin=$1 table=$2 parent=$3 chain=$4
+  while "$bin" -t "$table" -D "$parent" -j "$chain" 2>/dev/null; do :; done
+  "$bin" -t "$table" -F "$chain" 2>/dev/null || true
+  "$bin" -t "$table" -X "$chain" 2>/dev/null || true
+}
+
+up() {
+  [ -n "$UPLINK" ] || { echo "no default route; set PERSONA_UPLINK" >&2; exit 1; }
+  modprobe tun
+  sysctl -qw net.ipv4.ip_forward=1
+
+  # Namespace, bridge, veth.
+  [ -e "/run/netns/$NS" ] || ip netns add "$NS"
+  nsx sysctl -qw net.ipv4.ip_forward=1
+  nsx sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+  nsx sysctl -qw net.ipv6.conf.default.disable_ipv6=1
+  nsx ip link set lo up
+  nsx ip link show "$BR" >/dev/null 2>&1 || nsx ip link add "$BR" type bridge
+  nsx ip addr replace "$BR_ADDR" dev "$BR"
+  nsx ip link set "$BR" up
+
+  if ! ip link show "$HOST_VETH" >/dev/null 2>&1; then
+    ip link add "$HOST_VETH" type veth peer name "$NS_VETH" netns "$NS"
+  fi
+  ip addr replace "$HOST_VETH_ADDR" dev "$HOST_VETH"
+  ip link set "$HOST_VETH" up
+  nsx ip addr replace "$NS_VETH_ADDR" dev "$NS_VETH"
+  nsx ip link set "$NS_VETH" up
+  nsx ip route replace default via "$HOST_VETH_IP"
+  ip route replace "$VM_CIDR" via "$NS_VETH_IP" dev "$HOST_VETH"
+
+  # Host INPUT: VMs can't open connections to the host (runs before ufw's LAN
+  # allows). Replies to connections the host opened into a VM are let through.
+  ensure_chain "$IPT" filter INPUT PERSONA-IN
+  "$IPT" -A PERSONA-IN -i "$HOST_VETH" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  "$IPT" -A PERSONA-IN -i "$HOST_VETH" -j DROP
+
+  # Host FORWARD: replies back in; VMs out to public addresses only.
+  ensure_chain "$IPT" filter FORWARD PERSONA-FWD
+  "$IPT" -A PERSONA-FWD -o "$HOST_VETH" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  "$IPT" -A PERSONA-FWD -o "$HOST_VETH" -j DROP
+  "$IPT" -A PERSONA-FWD -i "$HOST_VETH" ! -s "$VM_CIDR" -j DROP
+  for cidr in "${BLOCKED[@]}"; do
+    "$IPT" -A PERSONA-FWD -i "$HOST_VETH" -d "$cidr" -j DROP
+  done
+  "$IPT" -A PERSONA-FWD -i "$HOST_VETH" -o "$UPLINK" -j ACCEPT
+  "$IPT" -A PERSONA-FWD -i "$HOST_VETH" -j DROP
+
+  ensure_chain "$IPT" nat POSTROUTING PERSONA-NAT
+  "$IPT" -t nat -A PERSONA-NAT -s "$VM_CIDR" -o "$UPLINK" -j MASQUERADE
+
+  # IPv6 is disabled in the netns; drop anything that slips through anyway.
+  if command -v "$IP6T" >/dev/null; then
+    ensure_chain "$IP6T" filter INPUT PERSONA-IN
+    "$IP6T" -A PERSONA-IN -i "$HOST_VETH" -j DROP
+    ensure_chain "$IP6T" filter FORWARD PERSONA-FWD
+    "$IP6T" -A PERSONA-FWD -i "$HOST_VETH" -j DROP
+    "$IP6T" -A PERSONA-FWD -o "$HOST_VETH" -j DROP
+  fi
+  echo "persona netns '$NS' up: bridge $BR ($BR_ADDR), NAT via $UPLINK"
+}
+
+down() {
+  drop_chain "$IPT" nat POSTROUTING PERSONA-NAT
+  drop_chain "$IPT" filter FORWARD PERSONA-FWD
+  drop_chain "$IPT" filter INPUT PERSONA-IN
+  if command -v "$IP6T" >/dev/null; then
+    drop_chain "$IP6T" filter FORWARD PERSONA-FWD
+    drop_chain "$IP6T" filter INPUT PERSONA-IN
+  fi
+  ip route del "$VM_CIDR" 2>/dev/null || true
+  ip link del "$HOST_VETH" 2>/dev/null || true
+  [ -e "/run/netns/$NS" ] && ip netns del "$NS"
+  echo "persona netns '$NS' removed"
+}
+
+case "${1:-}" in
+  up) up ;;
+  down) down ;;
+  status)
+    nsx ip -br addr; nsx bridge link
+    "$IPT" -S PERSONA-FWD; "$IPT" -t nat -S PERSONA-NAT ;;
+  *) echo "usage: $0 {up|down|status}" >&2; exit 2 ;;
+esac

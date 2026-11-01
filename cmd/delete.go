@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/johndavisdev/persona/internal/docker"
+	"github.com/johndavisdev/persona/internal/instance"
 	"github.com/johndavisdev/persona/internal/persona"
 	"github.com/johndavisdev/persona/internal/ui"
 )
@@ -26,16 +27,18 @@ func newDeleteCmd() *cobra.Command {
 				}
 			}
 			dockerOK := docker.Available(ctx) == nil
+			rt := instance.Current()
+			rtOK := rt.Available(ctx) == nil
 			for _, name := range args {
-				var cs []docker.Container
-				if dockerOK {
+				var cs []instance.Container
+				if rtOK {
 					var err error
-					if cs, err = docker.List(ctx, name); err != nil {
+					if cs, err = rt.List(ctx, name); err != nil {
 						return err
 					}
 				}
 				if len(cs) > 0 && !force {
-					return fmt.Errorf("persona %q has %d container(s); stop them first or pass --force", name, len(cs))
+					return fmt.Errorf("persona %q has %d instance(s); stop them first or pass --force", name, len(cs))
 				}
 				if !force {
 					ok, err := confirm(fmt.Sprintf("Delete persona %q? This removes its Dockerfile and image.", name), false)
@@ -51,10 +54,12 @@ func newDeleteCmd() *cobra.Command {
 					}
 				}
 				for _, c := range cs {
-					if err := docker.Remove(ctx, c.Name); err != nil {
+					if err := rt.Remove(ctx, c.Name); instance.IsKept(err) {
+						ui.Warning(out, err.Error())
+					} else if err != nil {
 						return err
 					}
-					ui.Step(out, "removed container "+c.Name)
+					ui.Step(out, "removed instance "+c.Name)
 				}
 				if dockerOK && !keepImage {
 					if err := docker.RemoveImage(ctx, persona.ImageFor(name)); err != nil {
@@ -69,7 +74,7 @@ func newDeleteCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVarP(&force, "force", "f", false, "skip confirmation and remove running containers")
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "skip confirmation and remove running instances")
 	cmd.Flags().BoolVar(&keepImage, "keep-image", false, "keep the docker image")
 	return cmd
 }

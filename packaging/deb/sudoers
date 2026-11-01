@@ -1,0 +1,4 @@
+# Installed by the persona package. Members of persona-vm may run the microVM
+# wrapper as root, and nothing else. It only acts on files and VMs the caller
+# owns; see /usr/share/doc/persona/README.md.
+%persona-vm ALL=(root) NOPASSWD: /usr/libexec/persona/persona-vm

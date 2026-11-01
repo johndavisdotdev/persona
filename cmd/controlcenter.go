@@ -5,7 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/johndavisdev/persona/internal/docker"
+	"github.com/johndavisdev/persona/internal/instance"
 	"github.com/johndavisdev/persona/internal/tui"
 )
 
@@ -18,7 +18,7 @@ func newControlCenterCmd() *cobra.Command {
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
-			if err := docker.Available(ctx); err != nil {
+			if err := instance.Current().Available(ctx); err != nil {
 				return err
 			}
 			return tui.Run(ctx, func(ctx context.Context, name string, cols, rows int) (string, error) {

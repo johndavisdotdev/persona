@@ -1,0 +1,18 @@
+Package: persona
+Version: @VERSION@
+Architecture: amd64
+Maintainer: John Davis <john@johndavis.dev>
+Installed-Size: @SIZE@
+Depends: sudo, iproute2, iptables, kmod, rsync, git, ca-certificates, e2fsprogs (>= 1.47.1), libarchive13t64
+Recommends: docker-ce | docker.io, gh
+Section: devel
+Priority: optional
+Homepage: https://github.com/johndavisdotdev/persona
+Description: Claude Code personas in containers or Firecracker microVMs
+ persona builds, spawns, and multiplexes Claude Code "personas": minimal
+ Debian images with the plugins, skills, and MCP servers a role needs.
+ .
+ On this platform instances run as Firecracker microVMs by default. The
+ package bundles Firecracker @FC_VERSION@ and its jailer, a guest kernel, the
+ persona-vm root wrapper (allowed via sudo for the persona-vm group only), and
+ a shared network namespace that gives VMs internet access but not the LAN.

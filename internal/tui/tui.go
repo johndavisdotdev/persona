@@ -19,7 +19,7 @@ import (
 	"github.com/charmbracelet/harmonica"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/johndavisdev/persona/internal/docker"
+	"github.com/johndavisdev/persona/internal/instance"
 	"github.com/johndavisdev/persona/internal/persona"
 	"github.com/johndavisdev/persona/internal/ui"
 )
@@ -62,7 +62,7 @@ type model struct {
 	showHelp      bool
 
 	personas   []*persona.Persona
-	containers []docker.Container
+	containers []instance.Container
 	items      []sideItem
 	cursor     int
 	seeded     bool
@@ -87,7 +87,11 @@ type model struct {
 }
 
 // Run starts the control center.
+// rt is the runtime instances run on, fixed for the life of the TUI.
+var rt instance.Runtime = instance.Docker{}
+
 func Run(ctx context.Context, spawn SpawnFunc) error {
+	rt = instance.Current()
 	m := &model{
 		ctx:         ctx,
 		spawn:       spawn,
@@ -119,7 +123,7 @@ type frameMsg struct{}
 
 type dataMsg struct {
 	personas   []*persona.Persona
-	containers []docker.Container
+	containers []instance.Container
 	err        error
 }
 
@@ -153,7 +157,7 @@ func (m *model) load() tea.Cmd {
 	ctx := m.ctx
 	return func() tea.Msg {
 		ps, _ := persona.List()
-		cs, err := docker.List(ctx, "")
+		cs, err := rt.List(ctx, "")
 		return dataMsg{personas: ps, containers: cs, err: err}
 	}
 }
@@ -194,7 +198,7 @@ func (m *model) sidebarWidth() int { return int(math.Round(math.Max(0, m.sidebar
 
 func (m *model) rebuildItems() {
 	var items []sideItem
-	byPersona := map[string][]docker.Container{}
+	byPersona := map[string][]instance.Container{}
 	for _, c := range m.containers {
 		byPersona[c.Persona] = append(byPersona[c.Persona], c)
 	}
@@ -511,9 +515,11 @@ func (m *model) handleNormal(msg tea.KeyPressMsg) tea.Cmd {
 		m.busy++
 		m.setStatus(false, "Stopping %s…", name)
 		return tea.Batch(m.spin.Tick, func() tea.Msg {
-			err := docker.Stop(ctx, name)
+			err := rt.Stop(ctx, name)
 			if err == nil {
-				err = docker.Remove(ctx, name)
+				if err = rt.Remove(ctx, name); instance.IsKept(err) {
+					err = nil // the worktree was kept on purpose
+				}
 			}
 			return stoppedMsg{container: name, err: err}
 		})
@@ -529,7 +535,7 @@ func (m *model) handleNormal(msg tea.KeyPressMsg) tea.Cmd {
 			return nil
 		}
 		name, ctx := p.container, m.ctx
-		_, _ = docker.Exec(ctx, name, "tmux", "set-option", "-t", persona.SessionName, "window-size", "latest")
+		_, _ = rt.Exec(ctx, name, "tmux", "set-option", "-t", persona.SessionName, "window-size", "latest")
 		return tea.ExecProcess(attachCmd(ctx, name), func(err error) tea.Msg { return attachedMsg{err: err} })
 	case key.Matches(msg, keys.NextPane):
 		if len(t.panes) > 0 {
@@ -572,7 +578,7 @@ func (m *model) handleNormal(msg tea.KeyPressMsg) tea.Cmd {
 }
 
 func attachCmd(ctx context.Context, container string) *exec.Cmd {
-	c := docker.AttachCommand(ctx, container)
+	c := rt.AttachCommand(ctx, container)
 	c.Stdin, c.Stdout, c.Stderr = nil, nil, nil // let Bubble Tea wire the terminal
 	return c
 }

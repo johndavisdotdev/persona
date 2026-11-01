@@ -1,0 +1,21 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: persona
+Source: https://github.com/johndavisdotdev/persona
+
+Files: usr/bin/persona usr/libexec/persona/persona-vm usr/libexec/persona/persona-netns
+Copyright: John Davis
+License: see the persona repository
+
+Files: usr/libexec/persona/firecracker usr/libexec/persona/jailer
+Copyright: Amazon.com, Inc. or its affiliates
+License: Apache-2.0
+ Unmodified Firecracker release binaries. See firecracker/LICENSE, NOTICE and
+ THIRD-PARTY in this directory, or /usr/share/common-licenses/Apache-2.0.
+
+Files: usr/share/persona/vmlinux
+Copyright: Linus Torvalds and others
+License: GPL-2.0-only
+ A Linux kernel built by the Firecracker project's CI from unmodified upstream
+ sources; its configuration is in vmlinux.config in this directory. The
+ corresponding source is the upstream Linux release of the same version,
+ https://cdn.kernel.org/pub/linux/kernel/, or /usr/share/common-licenses/GPL-2.

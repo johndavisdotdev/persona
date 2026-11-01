@@ -59,6 +59,9 @@ images with the plugins, skills, and MCP servers a role needs already installed.
 		newBuildCmd(),
 		newBaseCmd(),
 		newEditBaseCmd(),
+		newBrokerCmd(),
+		newVMAttachCmd(),
+		newVMRshCmd(),
 	)
 	styleHelp(root)
 	return root
