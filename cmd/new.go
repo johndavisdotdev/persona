@@ -66,10 +66,10 @@ servers pre-installed. The image is then built so the persona can be spawned.`,
 				return errors.New("a persona description is required (--description or --description-file)")
 			}
 			if viper.GetString(config.KeyAnthropicAPIKey) == "" {
-				return errors.New("ANTHROPIC_API_KEY is not set; the persona designer needs it")
+				return errors.New("no Anthropic API key: the persona designer needs one (run `persona configure`, or set ANTHROPIC_API_KEY)")
 			}
 			if !useExa && !noExa {
-				ui.Warning(out, "EXA_API_KEY not set: searching built-in marketplaces only")
+				ui.Warning(out, "no Exa API key: searching built-in marketplaces only (add one with `persona configure`)")
 			}
 
 			fmt.Fprintln(out, ui.Heading.Render("Designing "+name))

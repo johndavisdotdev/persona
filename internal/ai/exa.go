@@ -55,7 +55,7 @@ func (e *Exa) Contents(ctx context.Context, urls []string, maxChars int) ([]ExaR
 
 func (e *Exa) post(ctx context.Context, path string, body, out any) error {
 	if !e.Enabled() {
-		return errors.New("Exa is not configured (set EXA_API_KEY)")
+		return errors.New("Exa is not configured (run `persona configure`, or set EXA_API_KEY)")
 	}
 	b, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.exa.ai"+path, bytes.NewReader(b))

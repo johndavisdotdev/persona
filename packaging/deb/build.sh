@@ -18,11 +18,14 @@ S3=https://s3.amazonaws.com/spec.ccfc.min
 
 cd "$ROOT"
 VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
-case "$VERSION" in
-	v[0-9]*) DEBVER=${VERSION#v} ;;
-	[0-9]*) DEBVER=$VERSION ;;
-	*) DEBVER="0.0.0~git$(git log -1 --format=%cd.%h --date=format:%Y%m%d 2>/dev/null || date +%Y%m%d)" ;;
-esac
+# Only release tags (v1.2.3, 1.2.3-4-gabc) become versions; a bare commit hash
+# may start with a digit and would otherwise sort above every future release.
+if [[ $VERSION =~ ^v?[0-9]+\.[0-9]+ ]]; then
+	DEBVER=${VERSION#v}
+else
+	DEBVER="0.0.0~git$(git log -1 --format=%cd.%h --date=format:%Y%m%d 2>/dev/null || date +%Y%m%d)"
+	[[ $VERSION == *-dirty ]] && DEBVER+="+dirty"
+fi
 DEBVER=${DEBVER//-/+} # dashes are reserved for Debian revisions
 
 mkdir -p "$CACHE" "$OUT"

@@ -81,7 +81,7 @@ func Init(cfgFile, home string) error {
 			return err
 		}
 	}
-	return nil
+	return applyStoredKeys()
 }
 
 func defaultHome() string {

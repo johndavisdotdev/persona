@@ -73,7 +73,7 @@ warning) and the images are rebuilt.`,
 				next = persona.Base{}
 			case requirement != "":
 				if viper.GetString(config.KeyAnthropicAPIKey) == "" {
-					return errors.New("ANTHROPIC_API_KEY is not set; interpreting a requirement needs it (or use --add-plugin etc.)")
+					return errors.New("no Anthropic API key: interpreting a requirement needs one (run `persona configure`, or use --add-plugin etc.)")
 				}
 				useExa := !noExa && viper.GetString(config.KeyExaAPIKey) != ""
 				fmt.Fprintln(out, ui.Heading.Render("Interpreting requirement"))

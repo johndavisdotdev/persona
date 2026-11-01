@@ -7,11 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
+	"github.com/johndavisdev/persona/internal/auth"
 	"github.com/johndavisdev/persona/internal/config"
 	"github.com/johndavisdev/persona/internal/docker"
 	"github.com/johndavisdev/persona/internal/instance"
@@ -74,15 +77,27 @@ func Spawn(ctx context.Context, name string, o SpawnOptions) (string, error) {
 		}
 	}
 
-	var env []string
-	for _, k := range append(viper.GetStringSlice(config.KeyForwardEnv), p.Env...) {
-		if _, ok := os.LookupEnv(k); ok {
-			env = append(env, k) // value forwarded from host by docker, never on the command line
+	stored, err := auth.Load()
+	if err != nil {
+		return "", err
+	}
+	plan := auth.ForInstance(os.LookupEnv, append(viper.GetStringSlice(config.KeyForwardEnv), p.Env...), o.Env, stored)
+	for _, n := range plan.Notes {
+		ui.Step(log, n)
+	}
+	// Values are forwarded by name from this process's environment, never put
+	// on a command line, so the stored token is set here too.
+	env := plan.Forward
+	for _, kv := range plan.Inject {
+		k, v, _ := strings.Cut(kv, "=")
+		if err := os.Setenv(k, v); err != nil {
+			return "", err
 		}
+		env = append(env, k)
 	}
 	env = append(env, o.Env...)
-	if os.Getenv("ANTHROPIC_API_KEY") == "" && os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") == "" {
-		ui.Warning(log, "neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set; Claude Code will ask you to log in (run `claude setup-token` to create a token)")
+	if !plan.HasCredentials() && !slices.Contains(o.Env, auth.APIKeyEnv) && !slices.Contains(o.Env, auth.TokenEnv) {
+		ui.Warning(log, "no Claude credentials for the instance; Claude Code will ask you to log in (run `persona auth login` to use your Claude subscription)")
 	}
 
 	claudeArgs := ""
@@ -103,8 +118,13 @@ func newSpawnCmd() *cobra.Command {
 		Short: "Spawn an instance running Claude Code as the given persona",
 		Long: `Starts a detached instance from the persona's image (building it first if
 needed). Claude Code runs inside a tmux session; attach with --attach,
-` + "`persona join`" + `, or the control center. ANTHROPIC_API_KEY,
-CLAUDE_CODE_OAUTH_TOKEN, and the persona's declared env vars are forwarded.
+` + "`persona join`" + `, or the control center. The persona's declared env vars
+are forwarded.
+
+Claude Code signs in with your subscription token: CLAUDE_CODE_OAUTH_TOKEN if
+it is exported, otherwise the one stored by ` + "`persona auth login`" + `. With a
+token, ANTHROPIC_API_KEY is not forwarded unless you pass -e ANTHROPIC_API_KEY;
+without one, ANTHROPIC_API_KEY is used.
 
 On Linux the default runtime is firecracker, and the instance is a microVM.
 Inside a git repository it gets its own branch, persona/<instance>, with a

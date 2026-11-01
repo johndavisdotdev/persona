@@ -14,9 +14,12 @@ persona control-center           # TUI: split panes + tabs across running person
 - Docker (Docker Desktop, OrbStack, Colima, …) with BuildKit (the default)
 - On Linux, KVM and the persona `.deb` for the default [microVM runtime](#microvm-runtime-linux),
   or `runtime: docker` to use containers instead
-- `ANTHROPIC_API_KEY`, used by the persona designer and forwarded into containers.
-  You can use `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` for the containers instead.
-- Optional: `EXA_API_KEY` lets the designer search the web for niche third-party marketplaces and MCP servers.
+- An Anthropic API key for the persona designer (`persona new`, `update --redesign`, `base`): run `persona configure`
+  once, or export `ANTHROPIC_API_KEY`.
+- For instances, your Claude subscription: run `persona auth login` once (see [Credentials](#credentials)).
+  Without it, instances use `ANTHROPIC_API_KEY` instead.
+- Optional: an Exa API key (`persona configure`, or `EXA_API_KEY`) lets the designer search the web for niche
+  third-party marketplaces and MCP servers.
 
 ## Commands
 
@@ -30,6 +33,8 @@ persona control-center           # TUI: split panes + tabs across running person
 | `build <name>` | Rebuilds the image |
 | `base ["requirement"]` | Shows or changes the **base requirements** that every persona gets, e.g. `persona base "All personas should have the Linear plugin from the default anthropic marketplace installed."`. Also takes the precise `--add-*/--remove-*` flags and `--clear`. |
 | `edit-base` | Hand-edit `base.yaml`. `--settings` edits `base-settings.json`, the settings every persona starts from. |
+| `configure` | Prompts for the Anthropic and Exa API keys the designer uses and stores them (mode 0600). Exported `ANTHROPIC_API_KEY` / `EXA_API_KEY` take precedence. |
+| `auth login / status / logout` | Stores the Claude subscription token instances sign in with (see [Credentials](#credentials)) |
 | `spawn <persona>` | Starts a detached container (mounts the current directory at `/workspace`). Claude Code runs inside tmux. Flags: `-a` attach, `-p` initial prompt, `-w` workdir, `--no-mount`, `--skip-permissions`. |
 | `join [ref]` | Attaches to a running session (detach: `Ctrl-b d`) |
 | `stop <ref>… / --all` | Stops and removes containers (`--keep` leaves them stopped) |
@@ -71,6 +76,28 @@ the clone steps run, and is never written into an image layer.
 the same name as a base entry, the persona's entry wins. Base instructions are appended to every CLAUDE.md, and the
 base model applies to personas that don't set one. Changing the base regenerates every Dockerfile that hasn't been
 hand-edited and offers to rebuild. Running containers keep their old image until you respawn them.
+
+## Credentials
+
+Instances sign in to Claude Code with your Claude subscription (Pro, Max, Team or Enterprise), not an API key:
+
+```sh
+persona auth login     # runs `claude setup-token`, then asks you to paste the token
+persona auth status    # what new instances will get
+persona auth logout    # delete the stored token
+```
+
+`claude setup-token` creates a one-year OAuth token for headless use. persona stores it in
+`$PERSONA_HOME/credentials/claude-oauth-token.json` (mode 0600). Each instance receives it as
+`CLAUDE_CODE_OAUTH_TOKEN`: in a microVM through a file on tmpfs, and in Docker forwarded by name, so the value
+never appears on a command line. On another machine, pipe a token in instead with `persona auth login --stdin`.
+
+- A `CLAUDE_CODE_OAUTH_TOKEN` exported in your shell takes precedence over the stored one.
+- With a token, `ANTHROPIC_API_KEY` is not forwarded, because Claude Code would prefer it and bill the API.
+  Pass `persona spawn -e ANTHROPIC_API_KEY` to forward it anyway.
+- persona never copies `~/.claude` credentials into instances. Each one runs the unmodified Claude Code with that
+  token, and all of them share your plan's usage limits.
+- Running instances keep the credentials they started with. Respawn them after `login` or `logout`.
 
 ## Control center
 

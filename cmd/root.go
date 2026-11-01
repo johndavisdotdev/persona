@@ -59,6 +59,8 @@ images with the plugins, skills, and MCP servers a role needs already installed.
 		newBuildCmd(),
 		newBaseCmd(),
 		newEditBaseCmd(),
+		newConfigureCmd(),
+		newAuthCmd(),
 		newBrokerCmd(),
 		newVMAttachCmd(),
 		newVMRshCmd(),
