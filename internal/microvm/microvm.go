@@ -44,9 +44,13 @@ var (
 	Subnet = net.IPNet{IP: net.IPv4(10, 200, 0, 0).To4(), Mask: net.CIDRMask(16, 32)}
 	// Gateway is the bridge address inside the namespace.
 	Gateway = net.IPv4(10, 200, 0, 1).To4()
-	// Nameservers are public resolvers, since VMs can't reach any LAN host,
+	// Nameservers: persona-dns on the bridge (which resolves spawn names in
+	// the asking VM's namespace and forwards the rest), then a public
+	// resolver in case it is down. VMs can't reach any LAN host,
 	// including the LAN's DNS server.
-	Nameservers = []string{"1.1.1.1", "8.8.8.8"}
+	Nameservers = []string{"10.200.0.1", "1.1.1.1"}
+	// SearchDomain makes a bare spawn name ("jill") resolve as jill.persona.
+	SearchDomain = "persona"
 )
 
 // Paths inside the jail. They are identical for every VM, which is what lets
@@ -71,9 +75,18 @@ type Spec struct {
 	// Overlay is this VM's writable layer (see NewOverlay), copied sparsely
 	// into the jail. Without one, writes go to guest memory.
 	Overlay string
-	VCPUs   int64
-	MemMiB  int64
-	IP      net.IP // address in Subnet
+	// Stores are the store layers (see Store) the guest mounts together on
+	// /nix/store, hard linked into the jail read-only like Rootfs.
+	Stores []string
+	VCPUs  int64
+	MemMiB int64
+	IP     net.IP // address in Subnet
+	// Namespace is the persona network namespace the VM joins ("" is
+	// DefaultNamespace). Every namespace has the same Subnet and Gateway.
+	Namespace string
+	// Spawn and Persona name the VM for persona-dns: Spawn resolves to IP
+	// for VMs in the same namespace.
+	Spawn, Persona string
 }
 
 // VM is a running microVM.
@@ -120,7 +133,7 @@ func Identity(id string, ip net.IP) agent.Identity {
 	_, _ = rand.Read(seed)
 	ones, _ := Subnet.Mask.Size()
 	return agent.Identity{Addr: fmt.Sprintf("%s/%d", ip.To4(), ones), Gateway: Gateway.String(), MAC: MAC(ip),
-		Hostname: id, Nameservers: Nameservers, TimeUnixNano: time.Now().UnixNano(), Seed: seed}
+		Hostname: id, Nameservers: Nameservers, Search: []string{SearchDomain}, TimeUnixNano: time.Now().UnixNano(), Seed: seed}
 }
 
 func (s Spec) validate() error {
@@ -152,6 +165,7 @@ func Start(ctx context.Context, s Spec) (*VM, error) {
 	if s.Overlay != "" {
 		files = append(files, "--file", "rw:"+s.Overlay+":"+jailOverlay)
 	}
+	files = append(files, storeFiles(s.Stores)...)
 	vm, err := launch(ctx, s, files...)
 	if err != nil {
 		return nil, err
@@ -207,6 +221,18 @@ func (v *VM) configure(ctx context.Context) error {
 			return err
 		},
 		func() error {
+			// After the overlay, so it stays /dev/vdb; the guest finds these by label.
+			for i := range s.Stores {
+				id := fmt.Sprintf("store%d", i)
+				if _, err := v.client.PutGuestDriveByID(ctx, id, &models.Drive{DriveID: firecracker.String(id),
+					PathOnHost: firecracker.String(jailStore(i)), IsRootDevice: firecracker.Bool(false),
+					IsReadOnly: firecracker.Bool(true)}); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		func() error {
 			_, err := v.client.PutGuestNetworkInterfaceByID(ctx, "eth0", &models.NetworkInterface{
 				IfaceID: firecracker.String("eth0"), HostDevName: firecracker.String(v.Tap), GuestMac: MAC(s.IP)})
 			return err
@@ -234,6 +260,7 @@ func (v *VM) configure(ctx context.Context) error {
 type Snapshot struct {
 	Dir     string // holds mem, vmstate, and overlay.ext4 if the VM had an overlay
 	Rootfs  string // the shared read-only image the snapshot was taken on
+	Stores  []string
 	Overlay bool
 	VCPUs   int64
 	MemMiB  int64
@@ -266,7 +293,7 @@ func (v *VM) Snapshot(ctx context.Context, dir string) (Snapshot, error) {
 			return Snapshot{}, err
 		}
 	}
-	return Snapshot{Dir: dir, Rootfs: v.spec.Rootfs, Overlay: v.spec.Overlay != "",
+	return Snapshot{Dir: dir, Rootfs: v.spec.Rootfs, Stores: v.spec.Stores, Overlay: v.spec.Overlay != "",
 		VCPUs: v.spec.VCPUs, MemMiB: v.spec.MemMiB}, nil
 }
 
@@ -274,7 +301,7 @@ func (v *VM) Snapshot(ctx context.Context, dir string) (Snapshot, error) {
 // it its own identity. Guest memory is hard linked into the jail and mapped
 // privately, so clones of one snapshot share its pages until they write them.
 func Restore(ctx context.Context, snap Snapshot, id string, ip net.IP) (*VM, error) {
-	s := Spec{ID: id, Rootfs: snap.Rootfs, IP: ip, VCPUs: snap.VCPUs, MemMiB: snap.MemMiB}
+	s := Spec{ID: id, Rootfs: snap.Rootfs, Stores: snap.Stores, IP: ip, VCPUs: snap.VCPUs, MemMiB: snap.MemMiB}
 	if err := s.validateNet(); err != nil {
 		return nil, err
 	}
@@ -287,6 +314,7 @@ func Restore(ctx context.Context, snap Snapshot, id string, ip net.IP) (*VM, err
 		s.Overlay = filepath.Join(snap.Dir, jailOverlay)
 		files = append(files, "--file", "rw:"+s.Overlay+":"+jailOverlay)
 	}
+	files = append(files, storeFiles(snap.Stores)...)
 	vm, err := launch(ctx, s, files...)
 	if err != nil {
 		return nil, err
@@ -309,10 +337,32 @@ func Restore(ctx context.Context, snap Snapshot, id string, ip net.IP) (*VM, err
 	return vm, nil
 }
 
+// jailStore is store layer i's name in the jail (the same in every jail, so
+// snapshots restore anywhere).
+func jailStore(i int) string { return fmt.Sprintf("store-%d.ext4", i) }
+
+func storeFiles(stores []string) []string {
+	var files []string
+	for i, st := range stores {
+		files = append(files, "--file", "ro:"+st+":"+jailStore(i))
+	}
+	return files
+}
+
 // launch asks persona-vm for a jailed Firecracker and connects to its API.
 func launch(ctx context.Context, s Spec, files ...string) (*VM, error) {
 	var out bytes.Buffer
-	if err := wrapper(ctx, &out, append([]string{"start", "--id", s.ID}, files...)...); err != nil {
+	args := []string{"start", "--id", s.ID}
+	if s.Namespace != "" {
+		args = append(args, "--ns", s.Namespace)
+	}
+	if s.IP != nil {
+		args = append(args, "--ip", s.IP.String())
+	}
+	if s.Spawn != "" {
+		args = append(args, "--name", s.Spawn, "--persona", s.Persona)
+	}
+	if err := wrapper(ctx, &out, append(args, files...)...); err != nil {
 		return nil, err
 	}
 	var in wrapperInfo
@@ -434,4 +484,17 @@ func Available(ctx context.Context, kernel string) error {
 		return fmt.Errorf("cannot run %s via sudo: %w", Wrapper, err)
 	}
 	return nil
+}
+
+// DiskName is the writable disk's file name, inside the jail and when saved.
+const DiskName = jailOverlay
+
+// SaveDisk pauses the VM and copies its writable disk into dir (replacing any
+// earlier copy). Flush the guest's filesystems first (agent quiesce).
+func (v *VM) SaveDisk(ctx context.Context, dir string) error {
+	if _, err := v.client.PatchVM(ctx, &models.VM{State: firecracker.String(models.VMStatePaused)}); err != nil {
+		return fmt.Errorf("microvm %s: pause: %w", v.ID, err)
+	}
+	_ = os.Remove(filepath.Join(dir, jailOverlay))
+	return wrapper(ctx, nil, "collect", v.ID, "--to", dir, jailOverlay)
 }

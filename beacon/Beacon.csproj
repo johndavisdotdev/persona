@@ -1,0 +1,87 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <RuntimeIdentifiers>win-x64;win-arm64;osx-arm64;linux-x64;linux-arm64;linux-musl-x64</RuntimeIdentifiers>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>persona-beacon</AssemblyName>
+    <RootNamespace>Beacon</RootNamespace>
+    <!-- Persona images (debian:trixie-slim by default) ship without libicu. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- Set up the NuGet package to be an MCP server -->
+    <PackAsTool>true</PackAsTool>
+    <PackageType>McpServer</PackageType>
+
+    <!-- Set up the MCP server to be a self-contained application that does not rely on a shared framework -->
+    <SelfContained>true</SelfContained>
+    <PublishSelfContained>true</PublishSelfContained>
+
+    <!-- Set up the MCP server to be a single file executable -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <!-- Every microVM image carries this binary: keep it small (~13 MB vs ~41 MB).
+         Trimming disables reflection-based JSON; tool types are in BeaconJsonContext. -->
+    <PublishTrimmed>true</PublishTrimmed>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+
+    <!-- Set recommended package metadata -->
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageId>SampleMcpServer</PackageId>
+    <PackageVersion>0.1.0-beta</PackageVersion>
+    <PackageTags>AI; MCP; server; stdio</PackageTags>
+    <Description>An MCP server using the MCP C# SDK.</Description>
+  </PropertyGroup>
+
+  <!-- Include additional files for browsing the MCP server. -->
+  <ItemGroup>
+    <None Include=".mcp\server.json" Pack="true" PackagePath="/.mcp/" />
+    <None Include="README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.37.0-rc1" />
+    <PackageReference Include="Grpc.Tools" Version="2.85.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="11.0.0-rc.1.26425.128" />
+    <PackageReference Include="ModelContextProtocol" Version="2.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Protobuf Include="..\protos\shapes.proto" GrpcServices="None" />
+  </ItemGroup>
+
+  <!--
+    Claude Code marketplace "persona" with the plugins "beacon" and "persona" (skills only):
+    Plugin/ is the template, plus the published binary in plugins/beacon/bin. Override the location with
+    -p:MarketplaceDir=DIR/.
+  -->
+  <ItemGroup>
+    <None Remove="Plugin\**" />
+    <ClaudePluginTemplate Include="Plugin\**\*" Exclude="Plugin\README.md" />
+  </ItemGroup>
+
+  <Target Name="PublishClaudePlugin" AfterTargets="Publish">
+    <PropertyGroup>
+      <MarketplaceDir Condition="'$(MarketplaceDir)' == ''">$(PublishDir)marketplace/</MarketplaceDir>
+      <MarketplaceDir>$([MSBuild]::EnsureTrailingSlash('$(MarketplaceDir)'))</MarketplaceDir>
+      <_BeaconPluginBin>$(MarketplaceDir)plugins/beacon/bin/</_BeaconPluginBin>
+      <_BeaconExecutable>$(PublishDir)$(AssemblyName)$(_NativeExecutableExtension)</_BeaconExecutable>
+    </PropertyGroup>
+    <RemoveDir Directories="$(MarketplaceDir)" />
+    <Copy SourceFiles="@(ClaudePluginTemplate)"
+          DestinationFiles="@(ClaudePluginTemplate->'$(MarketplaceDir)%(RecursiveDir)%(Filename)%(Extension)')" />
+    <!-- Stamp the package version into the plugin manifest. -->
+    <WriteLinesToFile File="$(MarketplaceDir)plugins/beacon/.claude-plugin/plugin.json" Overwrite="true"
+                      Lines="$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/Plugin/plugins/beacon/.claude-plugin/plugin.json').Replace('@VERSION@', '$(PackageVersion)'))" />
+    <WriteLinesToFile File="$(MarketplaceDir)plugins/persona/.claude-plugin/plugin.json" Overwrite="true"
+                      Lines="$([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/Plugin/plugins/persona/.claude-plugin/plugin.json').Replace('@VERSION@', '$(PackageVersion)'))" />
+    <Copy SourceFiles="$(_BeaconExecutable)" DestinationFolder="$(_BeaconPluginBin)" />
+    <Exec Condition="!$([MSBuild]::IsOSPlatform('Windows'))"
+          Command="chmod 0755 &quot;$(_BeaconPluginBin)$(AssemblyName)$(_NativeExecutableExtension)&quot;" />
+    <Message Importance="high" Text="Claude Code marketplace 'persona' (plugin 'beacon'): $(MarketplaceDir)" />
+  </Target>
+</Project>

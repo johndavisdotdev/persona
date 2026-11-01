@@ -3,6 +3,7 @@ package persona
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -37,7 +38,7 @@ func TestEffectivePersonaWinsAndBaseMerges(t *testing.T) {
 		AptPackages: []string{"jq"},
 	}
 	e := Effective(p, b)
-	if len(e.Plugins) != 2 || e.Plugins[0].Reason != "persona" {
+	if len(e.Plugins) != 4 || e.Plugins[0].Reason != "persona" { // + the beacon and persona plugins
 		t.Fatalf("plugins not merged with persona precedence: %+v", e.Plugins)
 	}
 	if e.MCPServers[0].URL != "https://persona.example" || len(e.MCPServers) != 1 {
@@ -51,20 +52,48 @@ func TestEffectivePersonaWinsAndBaseMerges(t *testing.T) {
 	}
 }
 
-func TestRenderDockerfileIncludesBase(t *testing.T) {
+func TestRenderIncludesBase(t *testing.T) {
 	setup(t)
 	if err := (&Base{Plugins: []Plugin{{Name: "linear", Marketplace: "claude-plugins-official"}},
 		Marketplaces: []Marketplace{{Name: "claude-plugins-official", Source: "anthropics/claude-plugins-official"}}}).Save(); err != nil {
 		t.Fatal(err)
 	}
-	df, err := RenderDockerfile(&Persona{Name: "x", MCPServers: []MCPServer{{Name: "m", Command: "uvx", Args: []string{"some-mcp"}}}})
+	d, err := Render(&Persona{Name: "x", Harness: HarnessClaude, MCPServers: []MCPServer{{Name: "m", Command: "uvx", Args: []string{"some-mcp"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"COPY --chown=claude:claude settings.json /home/claude/.claude/settings.json", "claude plugin install \"$id\"", "astral.sh/uv"} {
-		if !strings.Contains(df, want) {
-			t.Errorf("Dockerfile missing %q", want)
+	user, root := d.Files[FileSetupUser], d.Files[FileSetupRoot]
+	for _, want := range []string{`install -D -m 0644 "$S/settings.json" ~/.claude/settings.json`, `claude plugin install "$id"`, "claude.ai/install.sh"} {
+		if !strings.Contains(user, want) {
+			t.Errorf("setup-user.sh missing %q", want)
 		}
+	}
+	if !strings.Contains(d.Files[FileFlake], `"uv"`) {
+		t.Error("flake lacks uv for the uvx MCP server")
+	}
+	if !strings.Contains(root, ManagedSettingsPath) || !strings.Contains(root, MarketplaceDir) {
+		t.Error("setup-root.sh lacks managed settings or the persona marketplace")
+	}
+	var s map[string]any
+	if err := json.Unmarshal([]byte(d.Files[FileSettings]), &s); err != nil {
+		t.Fatal(err)
+	}
+	if s["enabledPlugins"].(map[string]any)["beacon@persona"] != true || s["extraKnownMarketplaces"].(map[string]any)["persona"] == nil {
+		t.Errorf("beacon plugin not enabled: %v", s["enabledPlugins"])
+	}
+}
+
+func TestFrozenPersonasKeepTheirFiles(t *testing.T) {
+	setup(t)
+	p := &Persona{Name: "x", Customized: &Customized{}}
+	if _, err := p.Generate(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(FlakePath("x")); !os.IsNotExist(err) {
+		t.Error("a customized persona must not be regenerated")
+	}
+	if !p.Frozen() || ErrFrozen(p) == nil {
+		t.Error("customized persona not frozen")
 	}
 }
 
@@ -83,6 +112,9 @@ func TestHandEditedFilesAreProtected(t *testing.T) {
 	}
 	if len(skipped) != 1 || skipped[0] != FileSettings {
 		t.Fatalf("expected settings.json to be skipped, got %v", skipped)
+	}
+	if _, err := os.Stat(filepath.Join(Dir("x"), DirFiles, "bin", "persona-entrypoint")); err != nil {
+		t.Fatalf("files/ not written: %v", err)
 	}
 	if edited, _ := p.EditedFiles(); len(edited) != 1 {
 		t.Fatalf("EditedFiles = %v", edited)

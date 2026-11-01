@@ -38,6 +38,20 @@ export CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 go build -trimpath -ldflags "-s -w -X github.com/johndavisdev/persona/cmd.Version=$VERSION" -o "$STAGE/usr/bin/persona" .
 go build -trimpath -ldflags "-s -w" -o "$STAGE/usr/libexec/persona/persona-vm" ./cmd/persona-vm
 
+echo "== persona marketplace (plugin beacon, with persona-beacon, in every image)"
+if [ -n "${MARKETPLACE:-}" ]; then
+	cp -R "$MARKETPLACE" "$STAGE/usr/share/persona/marketplace"
+else
+	command -v dotnet >/dev/null || { echo "persona-beacon needs the .NET SDK (or pass MARKETPLACE=/path/to/published/marketplace)" >&2; exit 1; }
+	bdir=$(mktemp -d -p "$STAGE")
+	dotnet publish "$ROOT/beacon/Beacon.csproj" -nologo -v q -c Release -r linux-x64 -o "$bdir"
+	cp -R "$bdir/marketplace" "$STAGE/usr/share/persona/marketplace"
+	rm -rf "$bdir"
+fi
+
+# Claude Code managed settings, installed in Claude Code personas' images.
+install -m 0644 "$ROOT/managed-settings.json" "$STAGE/usr/share/persona/managed-settings.json"
+
 echo "== Firecracker $FC_VERSION"
 tgz="firecracker-$FC_VERSION-x86_64.tgz"
 if [ ! -s "$CACHE/$tgz" ]; then
@@ -84,6 +98,7 @@ fi
 echo "== Scripts, units, config"
 install -m 0755 "$HERE/persona-netns" "$STAGE/usr/libexec/persona/persona-netns"
 install -m 0644 "$HERE/persona-netns.service" "$STAGE/usr/lib/systemd/system/persona-netns.service"
+install -m 0644 "$HERE/persona-dns.service" "$STAGE/usr/lib/systemd/system/persona-dns.service"
 install -m 0644 "$HERE/modules-load.conf" "$STAGE/usr/lib/modules-load.d/persona.conf"
 install -m 0440 "$HERE/sudoers" "$STAGE/etc/sudoers.d/persona-vm"
 /usr/sbin/visudo -cqf "$STAGE/etc/sudoers.d/persona-vm"

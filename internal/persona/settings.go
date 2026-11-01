@@ -72,6 +72,7 @@ func RenderSettings(p *Persona) (string, error) {
 		return "", err
 	}
 	merged := MergeSettings(baseSettings, specSettings(Effective(p, base)), p.Settings)
+	addStatusHooks(merged)
 	b, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return "", err
@@ -79,16 +80,33 @@ func RenderSettings(p *Persona) (string, error) {
 	return string(b) + "\n", nil
 }
 
+// builtinMarketplaces maps the built-in marketplaces' names to their sources.
+var builtinMarketplaces = map[string]string{
+	"claude-plugins-official": "anthropics/claude-plugins-official",
+	"claude-code-plugins":     "anthropics/claude-code",
+	"anthropic-agent-skills":  "anthropics/skills",
+}
+
 func specSettings(p *Persona) map[string]any {
 	s := map[string]any{}
 	if p.Model != "" {
 		s["model"] = p.Model
 	}
-	if len(p.Marketplaces) > 0 {
-		mps := map[string]any{}
-		for _, m := range p.Marketplaces {
-			mps[m.Name] = map[string]any{"source": marketplaceSource(m.Source)}
+	mps := map[string]any{}
+	for _, m := range p.Marketplaces {
+		mps[m.Name] = map[string]any{"source": marketplaceSource(m.Source)}
+	}
+	// Claude Code no longer pre-configures these by name (its built-in
+	// directory is "anthropic-plugin-directory"), so plugins referenced as
+	// name@claude-plugins-official etc. need their marketplace declared.
+	for _, pl := range p.Plugins {
+		if src, ok := builtinMarketplaces[pl.Marketplace]; ok {
+			if _, declared := mps[pl.Marketplace]; !declared {
+				mps[pl.Marketplace] = map[string]any{"source": marketplaceSource(src)}
+			}
 		}
+	}
+	if len(mps) > 0 {
 		s["extraKnownMarketplaces"] = mps
 	}
 	if len(p.Plugins) > 0 {

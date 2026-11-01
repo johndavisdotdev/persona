@@ -50,7 +50,9 @@
         "toolStyle": "chat",
         "toolOutput": "full",
         "diffStyle": "card",
-        "pieStyle": "round"
+        "pieStyle": "round",
+        "promptFillColor": "",
+        "replyFillColor": ""
       }
     }
   }

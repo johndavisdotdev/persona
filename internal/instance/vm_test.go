@@ -231,7 +231,7 @@ func TestVMRuntime(t *testing.T) {
 	}
 
 	// Stop saves uncommitted work; remove keeps the dirty worktree.
-	must("echo draft > /workspace/draft.txt && mkdir -p /workspace/node_modules && echo junk > /workspace/node_modules/x && echo node_modules > /workspace/.gitignore")
+	must("echo draft > /workspace/draft.txt && mkdir -p /workspace/node_modules && echo junk > /workspace/node_modules/x && echo node_modules > /workspace/.gitignore && echo kept > /home/claude/kept.txt")
 	if err := v.Stop(ctx, name); err != nil {
 		t.Fatal(err)
 	}
@@ -244,11 +244,59 @@ func TestVMRuntime(t *testing.T) {
 	if cs, _ := v.List(ctx, ""); len(cs) != 1 || cs[0].Running() {
 		t.Errorf("after stop: %+v", cs)
 	}
+
+	// Start resumes it with its disk: files outside the workspace, uncommitted
+	// work, branch and address all survive, and the session comes back.
+	tStart := time.Now()
+	if err := v.Start(ctx, name, []string{"PERSONA_TEST_SECRET"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("restarted in %v", time.Since(tStart).Round(time.Millisecond))
+	if out := must("cat /home/claude/kept.txt /workspace/draft.txt; git -C /workspace branch --show-current; git -C /workspace log -1 --format=%s"); out != "kept\ndraft\npersona/t1\nvm commit" {
+		t.Errorf("after restart: %q", out)
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		if _, err := v.Exec(ctx, name, "tmux", "has-session", "-t", persona.SessionName); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("no tmux session after restart: %v", err)
+		}
+	}
+	if out := must("grep -c 'This instance' ~/.claude/CLAUDE.md"); out != "1" {
+		t.Errorf("CLAUDE.md note repeated on restart: %s copies", out)
+	}
+
+	// Save captures the running spawn (not /workspace) as a new persona's
+	// image; the spawn keeps running, and the saved persona spawns.
+	tSave := time.Now()
+	if err := v.Save(ctx, name, "tester-saved"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { exec.Command("docker", "image", "rm", "-f", "persona/tester-saved:latest").Run() })
+	t.Logf("saved in %v", time.Since(tSave).Round(time.Millisecond))
+	if _, err := v.Exec(ctx, name, "true"); err != nil {
+		t.Errorf("spawn stopped by save: %v", err)
+	}
+	saved, err := v.Run(ctx, RunOptions{Persona: "tester-saved", Instance: "t2", Image: "persona/tester-saved:latest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := v.Exec(ctx, saved, "sh", "-c", "cat /home/claude/kept.txt; ls -A /workspace | wc -l; id -un"); err != nil ||
+		strings.TrimSpace(string(out)) != "kept\n0\nclaude" {
+		t.Errorf("saved persona's spawn: %q %v", out, err)
+	}
+	if err := v.Remove(ctx, saved); err != nil {
+		t.Errorf("kill saved spawn: %v", err)
+	}
+
 	if err := v.Remove(ctx, name); !IsKept(err) {
 		t.Errorf("Remove of a dirty worktree = %v, want KeptError", err)
 	}
 	if cs, _ := v.List(ctx, ""); len(cs) != 0 {
 		t.Errorf("after remove: %+v", cs)
+	}
+	if _, err := os.Stat(disksDir(name)); err == nil {
+		t.Error("kill left the spawn's disks behind")
 	}
 	if msg := sh(repo, "git log -1 --format=%s persona/t1"); msg != "vm commit" {
 		t.Errorf("host branch lost: %q", msg)
@@ -276,4 +324,19 @@ func TestMain(m *testing.M) {
 		}
 	}
 	os.Exit(code)
+}
+
+func TestImageDisksMatchOnlyTheirPersona(t *testing.T) {
+	if err := config.Init("", t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(config.VMDir(), "images")
+	os.MkdirAll(dir, 0o755)
+	for _, n := range []string{"app-0123456789ab-01234567.ext4", "app-saved-0123456789ab-01234567.ext4", "app-0123456789ab-01234567.ext4.partial"} {
+		os.WriteFile(filepath.Join(dir, n), nil, 0o644)
+	}
+	got := imageDisks("app")
+	if len(got) != 1 || filepath.Base(got[0]) != "app-0123456789ab-01234567.ext4" {
+		t.Errorf("imageDisks(app) = %v", got)
+	}
 }

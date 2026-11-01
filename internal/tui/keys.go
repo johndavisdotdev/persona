@@ -21,7 +21,7 @@ var keys = keyMap{
 	Spawn:     key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "spawn persona in new pane")),
 	NewPane:   key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "split: new pane")),
 	ClosePane: key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "close pane")),
-	StopPane:  key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "stop container")),
+	StopPane:  key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "kill the pane's spawn")),
 	Insert:    key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "type into pane")),
 	Leave:     key.NewBinding(key.WithKeys("ctrl+]", "f12"), key.WithHelp("ctrl+]", "back to normal")),
 	Attach:    key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "full-screen attach")),

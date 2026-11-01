@@ -19,10 +19,12 @@ import (
 	"github.com/johndavisdev/persona/internal/agent"
 	"github.com/johndavisdev/persona/internal/config"
 	"github.com/johndavisdev/persona/internal/microvm"
+	"github.com/johndavisdev/persona/internal/status"
 )
 
-// Broker serves guest-initiated requests (push, pr) for every running
-// microVM instance with a git workspace. It runs once per user, holds the
+// Broker serves guest-initiated requests for every running microVM spawn:
+// status events (stored for persona manage), and push, pr and fetch for
+// spawns with a git workspace. It runs once per user, holds the
 // only GitHub credentials involved (the host's git and gh), and only ever
 // pushes an instance's own branch.
 type Broker struct {
@@ -56,8 +58,20 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 	b.subs, b.busy = map[string]context.CancelFunc{}, map[string]*sync.Mutex{}
 	b.Log.Printf("started")
+	self, _ := os.Executable()
+	selfID := fileID(self)
 	idleSince := time.Now()
 	for {
+		// An upgrade replaced the binary: carry on as the new one, which
+		// knows any new requests. The lock is close-on-exec, so the new
+		// process takes it over.
+		if selfID != "" && fileID(self) != selfID {
+			b.Log.Printf("%s was replaced; restarting", self)
+			if err := syscall.Exec(self, os.Args, os.Environ()); err != nil {
+				b.Log.Printf("restart: %v", err)
+				selfID = fileID(self)
+			}
+		}
 		n := b.scan(ctx)
 		if n > 0 {
 			idleSince = time.Now()
@@ -73,14 +87,21 @@ func (b *Broker) Run(ctx context.Context) error {
 	}
 }
 
+// fileID identifies a file's current content: its inode and modification
+// time ("" if it can't be read).
+func fileID(path string) string {
+	var st syscall.Stat_t
+	if path == "" || syscall.Stat(path, &st) != nil {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d", st.Ino, st.Mtim.Nano())
+}
+
 // scan subscribes to new instances and drops ones that went away.
 func (b *Broker) scan(ctx context.Context) int {
 	recs, _ := allRecords()
 	live := map[string]bool{}
 	for _, r := range recs {
-		if r.Worktree == "" {
-			continue
-		}
 		if _, ok := microvm.Lookup(r.VMID); !ok {
 			continue
 		}
@@ -127,6 +148,25 @@ func (b *Broker) serve(ctx context.Context, name string) {
 }
 
 func (b *Broker) handle(ctx context.Context, name string, ev agent.Event) (json.RawMessage, error) {
+	if ev.Kind == agent.KindStatus {
+		rec, err := loadRecord(name)
+		if err != nil {
+			return nil, err
+		}
+		return nil, status.Append(rec.Instance, ev.Body)
+	}
+	if ev.Kind == agent.KindBeacon {
+		raw, err := beaconStatus(ev.Body)
+		if err != nil {
+			return nil, err
+		}
+		rec, err := loadRecord(name)
+		if err != nil {
+			return nil, err
+		}
+		b.Log.Printf("%s: beacon %s", name, ev.Body)
+		return nil, status.Append(rec.Instance, raw)
+	}
 	b.mu.Lock()
 	mu := b.busy[name]
 	b.mu.Unlock()
@@ -143,16 +183,37 @@ func (b *Broker) handle(ctx context.Context, name string, ev agent.Event) (json.
 	if !ok {
 		return nil, errors.New("instance is not running")
 	}
+	if ev.Kind == agent.KindFetch {
+		var req agent.FetchRequest
+		if len(ev.Body) > 0 && string(ev.Body) != "null" {
+			if err := json.Unmarshal(ev.Body, &req); err != nil {
+				return nil, errors.New("fetch: bad request")
+			}
+		}
+		res, err := fetchIntoVM(ctx, rec, vm, req.Branches)
+		if err != nil {
+			b.Log.Printf("%s: fetch failed: %v", name, err)
+			return nil, err
+		}
+		b.Log.Printf("%s: fetch %v", name, res.Refs)
+		return json.Marshal(res)
+	}
 	var res agent.PushResult
 	switch ev.Kind {
 	case agent.KindPush:
-		res, err = b.push(ctx, rec, vm)
+		var req agent.PushRequest
+		if len(ev.Body) > 0 && string(ev.Body) != "null" {
+			if err := json.Unmarshal(ev.Body, &req); err != nil {
+				return nil, errors.New("push: bad request")
+			}
+		}
+		res, err = b.push(ctx, rec, vm, req.Force)
 	case agent.KindPR:
 		var req agent.PRRequest
 		if err := json.Unmarshal(ev.Body, &req); err != nil || strings.TrimSpace(req.Title) == "" {
 			return nil, errors.New("pr needs a title")
 		}
-		if res, err = b.push(ctx, rec, vm); err == nil {
+		if res, err = b.push(ctx, rec, vm, req.Force); err == nil {
 			res.PR, err = b.pr(ctx, rec, req)
 		}
 	default:
@@ -166,8 +227,12 @@ func (b *Broker) handle(ctx context.Context, name string, ev agent.Event) (json.
 	return json.Marshal(res)
 }
 
-func (b *Broker) push(ctx context.Context, rec *record, vm *microvm.VM) (agent.PushResult, error) {
-	commit, err := fetchBranch(ctx, rec, vm)
+func (b *Broker) push(ctx context.Context, rec *record, vm *microvm.VM, force bool) (agent.PushResult, error) {
+	mode := fastForward
+	if force {
+		mode = keepChanges
+	}
+	commit, err := fetchBranch(ctx, rec, vm, mode)
 	if err != nil {
 		return agent.PushResult{}, err
 	}
@@ -176,7 +241,11 @@ func (b *Broker) push(ctx context.Context, rec *record, vm *microvm.VM) (agent.P
 		return agent.PushResult{}, errors.New("the host repository has no origin remote to push to")
 	}
 	ref := "refs/heads/" + rec.Branch
-	if _, err := git(ctx, rec.Repo, "push", "-q", "origin", ref+":"+ref); err != nil {
+	args := []string{"push", "-q"}
+	if force {
+		args = append(args, "--force-with-lease") // only over what this host last saw there
+	}
+	if _, err := git(ctx, rec.Repo, append(args, "origin", ref+":"+ref)...); err != nil {
 		return agent.PushResult{}, err
 	}
 	return agent.PushResult{Branch: rec.Branch, Commit: commit, Remote: remote}, nil

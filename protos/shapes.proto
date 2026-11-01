@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+option csharp_namespace = "Beacon.Shapes";
+option go_package = "github.com/johndavisdev/persona/shapes";
+
+package beacon;
+
+message IpAddress {
+  oneof address {
+    fixed32 ipv4 = 1; // Native 4-byte unsigned int (Big-Endian/Network Byte Order)
+    bytes ipv6   = 2; // Raw 16-byte array for IPv6 addresses
+  }
+}
+
+// Peers answer with an AgentAnnouncement, sent by unicast UDP to response_to
+// (or the datagram's source address when unset) at the datagram's source port.
+message DiscoverAgentsRequest {
+    IpAddress response_to = 1;
+}
+
+message AgentAnnouncement {
+  string name = 1;       // instance hostname
+  string persona = 2;    // persona the instance was spawned from
+  IpAddress address = 3;
+  uint32 port = 4;       // TCP port the agent takes DirectMessages on; 0 when it takes none
+}
+
+// Sent to one agent over TCP at its announced address and port. Both directions
+// carry a single varint-length-prefixed message: the sender writes a DirectMessage,
+// the receiver answers with a DirectMessageAck and closes the connection.
+message DirectMessage {
+  string message = 1;
+  AgentAnnouncement from = 2; // the sender, so the receiver can answer
+}
+
+message DirectMessageAck {
+  string error = 1; // empty when the message was accepted
+}
+
+message CommandFromGod {
+  string command = 1;
+}
+
+message MulticastRequest {
+  oneof request_type {
+      DiscoverAgentsRequest discovery = 1;
+      CommandFromGod command = 2;
+    }
+}
+
+
+message WorkFinished {
+}
+
+message Notification {
+}
+
+message OpenSelection {
+  repeated string choices = 1;
+}
+message ClosedSelection {
+  repeated string choices = 1;
+}
+message ConfirmationInput {
+  string yes_text = 1;
+  string no_text = 2;
+}
+message NeedInput {
+  string question = 1;
+  oneof input {
+      ConfirmationInput confirmation = 2;
+      ClosedSelection closed_selection = 3;
+      OpenSelection open_selection = 4;
+  }
+}
+message BrokerMessage {
+  oneof message_type {
+    WorkFinished finished = 1;
+    CommandFromGod command = 2;
+    NeedInput need_input = 3;
+  }
+}

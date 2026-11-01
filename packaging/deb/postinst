@@ -30,6 +30,10 @@ if [ "$1" = configure ]; then
 		else
 			systemctl start persona-netns.service || echo "persona: persona-netns.service failed to start; see: journalctl -u persona-netns" >&2
 		fi
+		# DNS for the VMs: restarting it is harmless (VMs fall back to a
+		# public resolver for the moment it is down) and picks up the new binary.
+		systemctl enable persona-dns.service >/dev/null 2>&1 || true
+		systemctl restart persona-dns.service || echo "persona: persona-dns.service failed to start; see: journalctl -u persona-dns" >&2
 	fi
 
 	[ -e /dev/kvm ] || echo "persona: /dev/kvm is missing; microVMs need KVM (enable virtualization, or set runtime: docker)" >&2

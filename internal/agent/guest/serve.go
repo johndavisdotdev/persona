@@ -262,7 +262,69 @@ func serveGuest() {
 			if err := json.NewDecoder(c).Decode(&ev); err != nil {
 				return
 			}
+			if ev.Kind == agent.KindStatus {
+				queueStatus(ev)
+				json.NewEncoder(c).Encode(agent.Reply{OK: true})
+				return
+			}
 			json.NewEncoder(c).Encode(forward(ev))
 		}()
+	}
+}
+
+// Status events are fire-and-forget: hooks must never wait on the host. They
+// queue here (bounded) and go to the broker whenever one is subscribed, so
+// events from before it connected aren't lost.
+var (
+	statusMu    sync.Mutex
+	statusQueue []agent.Event
+	statusWake  = make(chan struct{}, 1)
+)
+
+const statusQueueMax = 500
+
+func queueStatus(ev agent.Event) {
+	statusMu.Lock()
+	statusQueue = append(statusQueue, ev)
+	if len(statusQueue) > statusQueueMax {
+		statusQueue = statusQueue[len(statusQueue)-statusQueueMax:]
+	}
+	statusMu.Unlock()
+	select {
+	case statusWake <- struct{}{}:
+	default:
+	}
+}
+
+// sendStatus delivers queued status events to the current subscriber.
+func sendStatus() {
+	for {
+		select {
+		case <-statusWake:
+		case <-time.After(time.Second):
+		}
+		subMu.Lock()
+		s := sub
+		subMu.Unlock()
+		if s == nil {
+			continue
+		}
+		statusMu.Lock()
+		batch := statusQueue
+		statusQueue = nil
+		statusMu.Unlock()
+		for i, ev := range batch {
+			ev.ID = nextID.Add(1)
+			b, _ := json.Marshal(ev)
+			s.mu.Lock()
+			_, err := s.conn.Write(append(b, '\n'))
+			s.mu.Unlock()
+			if err != nil { // subscriber gone: requeue the rest
+				statusMu.Lock()
+				statusQueue = append(batch[i:], statusQueue...)
+				statusMu.Unlock()
+				break
+			}
+		}
 	}
 }

@@ -1,0 +1,11 @@
+{
+  "name": "persona",
+  "displayName": "Persona",
+  "version": "@VERSION@",
+  "description": "Skills for agents running as persona spawns: working with the spawn's git workspace through persona-agent",
+  "author": {
+    "name": "John Davis"
+  },
+  "repository": "https://github.com/johndavisdev/persona",
+  "keywords": ["persona", "git", "microvm"]
+}

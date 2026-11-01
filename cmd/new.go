@@ -21,16 +21,21 @@ import (
 func newNewCmd() *cobra.Command {
 	var (
 		name, description, descFile, fromSpec string
-		yes, noBuild, noExa                   bool
+		yes, ask, noBuild, noExa, noFix       bool
 	)
 	cmd := &cobra.Command{
 		Use:   "new [name]",
 		Short: "Design a new persona with AI (guided wizard)",
 		Long: `Describe a persona in plain language. Claude interprets it, searches the
 built-in plugin marketplaces (and, with EXA_API_KEY set, the web for niche
-third-party marketplaces and MCP servers), and generates a Dockerfile for a
-minimal Debian image with Claude Code and the chosen plugins, skills, and MCP
-servers pre-installed. The image is then built so the persona can be spawned.`,
+third-party marketplaces and MCP servers), and generates the image
+definition: a Nix flake with the toolchains and packages, plus setup scripts
+that install the harness and the chosen plugins, skills and MCP servers. Every language the description
+mentions is installed. The image is then built so the persona can be spawned.
+
+Only the name and description are asked for (when not given as arguments);
+the design is accepted as-is and built. Pass --ask to choose whether to search
+the web, review the selected components, and confirm before building.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -46,14 +51,15 @@ servers pre-installed. The image is then built so the persona can be spawned.`,
 				description = string(b)
 			}
 			if fromSpec != "" {
-				return importSpec(cmd, fromSpec, name, noBuild)
+				return importSpec(cmd, fromSpec, name, noBuild, noFix)
 			}
 			useExa := !noExa && viper.GetString(config.KeyExaAPIKey) != ""
 			interactive := ui.Interactive() && !yes
+			ask = ask && interactive
 
-			if interactive {
+			if interactive && (ask || name == "" || strings.TrimSpace(description) == "") {
 				fmt.Fprintln(out, ui.Title.Render("✦ New persona"))
-				if err := wizard(&name, &description, &useExa, !noExa && viper.GetString(config.KeyExaAPIKey) != ""); err != nil {
+				if err := wizard(&name, &description, &useExa, ask && useExa); err != nil {
 					return err
 				}
 			}
@@ -79,8 +85,11 @@ servers pre-installed. The image is then built so the persona can be spawned.`,
 			}
 			fmt.Fprintln(out)
 			fmt.Fprintln(out, ui.RenderPersona(p))
+			if err := reviewCustomInstalls(p, out, ask); err != nil {
+				return err
+			}
 
-			if interactive {
+			if ask {
 				if err := reviewComponents(p); err != nil {
 					return err
 				}
@@ -94,14 +103,14 @@ servers pre-installed. The image is then built so the persona can be spawned.`,
 			ui.Success(out, "Saved persona to "+persona.Dir(name))
 
 			build := !noBuild
-			if interactive && build {
+			if ask && build {
 				if build, err = confirm("Build the image now?", true); err != nil {
 					return err
 				}
 			}
 			if build {
-				if err := buildImage(ctx, name, false, out); err != nil {
-					return fmt.Errorf("%w\nfix the Dockerfile with `persona edit %s`, then run `persona build %s`", err, name, name)
+				if err := buildWithRepair(ctx, name, !noFix, out); err != nil {
+					return fmt.Errorf("%w\nfix flake.nix or the setup scripts with `persona edit %s`, then run `persona build %s`", err, name, name)
 				}
 				fmt.Fprintf(out, "\nSpawn it with %s\n", ui.Bold.Render("persona spawn "+name+" --attach"))
 			} else {
@@ -114,8 +123,10 @@ servers pre-installed. The image is then built so the persona can be spawned.`,
 	f.StringVarP(&name, "name", "n", "", "persona name")
 	f.StringVarP(&description, "description", "d", "", "persona description")
 	f.StringVar(&descFile, "description-file", "", "read the persona description from a file")
-	f.BoolVarP(&yes, "yes", "y", false, "non-interactive: accept the AI's design as-is")
-	f.BoolVar(&noBuild, "no-build", false, "write the Dockerfile but do not build the image")
+	f.BoolVar(&ask, "ask", false, "ask whether to search the web, review the selected components, and confirm before building")
+	f.BoolVarP(&yes, "yes", "y", false, "never prompt (fail if the name or description is missing)")
+	f.BoolVar(&noBuild, "no-build", false, "write the image definition but do not build it")
+	f.BoolVar(&noFix, "no-fix", false, "if the build fails, don't let Claude fix flake.nix and rebuild")
 	f.BoolVar(&noExa, "no-exa", false, "disable Exa web search for third-party marketplaces")
 	f.StringVar(&fromSpec, "from-spec", "", "create the persona from an existing persona.yaml (no AI); the name argument overrides the file's name")
 	return cmd
@@ -225,7 +236,7 @@ func pruneMarketplaces(p *persona.Persona) {
 }
 
 // importSpec creates a persona from a YAML definition without the AI designer.
-func importSpec(cmd *cobra.Command, path, name string, noBuild bool) error {
+func importSpec(cmd *cobra.Command, path, name string, noBuild, noFix bool) error {
 	ctx, out := cmd.Context(), cmd.OutOrStdout()
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -241,7 +252,7 @@ func importSpec(cmd *cobra.Command, path, name string, noBuild bool) error {
 	if err := validateNewName(p.Name); err != nil {
 		return err
 	}
-	p.CreatedAt, p.DockerfileHash, p.SettingsHash = time.Time{}, "", ""
+	p.CreatedAt, p.FileHashes, p.DockerfileHash, p.SettingsHash = time.Time{}, nil, "", ""
 	if err := p.Save(); err != nil {
 		return err
 	}
@@ -253,5 +264,5 @@ func importSpec(cmd *cobra.Command, path, name string, noBuild bool) error {
 	if noBuild {
 		return nil
 	}
-	return buildImage(ctx, p.Name, false, out)
+	return buildWithRepair(ctx, p.Name, !noFix, out)
 }

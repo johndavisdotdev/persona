@@ -251,15 +251,17 @@ func styleHelp(root *cobra.Command) {
 
 	root.AddGroup(
 		&cobra.Group{ID: groupPersonas, Title: "Personas"},
-		&cobra.Group{ID: groupRun, Title: "Run & multiplex"},
+		&cobra.Group{ID: groupRun, Title: "Spawns"},
 		&cobra.Group{ID: groupBase, Title: "Shared base"},
 		&cobra.Group{ID: groupMore, Title: "More"},
 	)
 	groups := map[string]string{
 		"new": groupPersonas, "list": groupPersonas, "update": groupPersonas, "edit": groupPersonas,
 		"delete": groupPersonas, "build": groupPersonas,
-		"spawn": groupRun, "join": groupRun, "stop": groupRun, "control-center": groupRun,
+		"spawn": groupRun, "ps": groupRun, "attach": groupRun, "stop": groupRun, "start": groupRun,
+		"save": groupRun, "kill": groupRun, "control-center": groupRun, "manage": groupRun,
 		"base": groupBase, "edit-base": groupBase,
+		"configure": groupMore, "auth": groupMore,
 	}
 	for _, c := range root.Commands() {
 		if g, ok := groups[c.Name()]; ok {

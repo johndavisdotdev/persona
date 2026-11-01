@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/protos/">
+    <File Path="protos\shapes.proto" />
+  </Folder>
+  <Project Path="beacon/Beacon.csproj" />
+</Solution>

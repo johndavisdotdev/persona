@@ -1,0 +1,33 @@
+{
+    "compilerOptions": {
+        "module": "preserve",
+        "moduleResolution": "bundler",
+        "moduleDetection": "force",
+        "target": "es2023",
+        "lib": [
+            "es2023",
+            "DOM"
+        ],
+        "isolatedModules": true,
+        "strict": true,
+        "noEmit": true,
+        "jsx": "react",
+        "declaration": false,
+        "allowArbitraryExtensions": true,
+        "allowImportingTsExtensions": true,
+        "forceConsistentCasingInFileNames": true,
+        "baseUrl": ".",
+        "paths": {
+            "@/*": [
+                "./src/*"
+            ]
+        }
+    },
+    "include": [
+        "./src/**/*.tsx?"
+    ],
+    "exclude": [
+        "node_modules",
+        "dist"
+    ]
+}

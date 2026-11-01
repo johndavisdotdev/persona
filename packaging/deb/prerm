@@ -9,6 +9,8 @@ if [ "$1" = remove ] || [ "$1" = deconfigure ]; then
 		/usr/libexec/persona/persona-vm stop "$id" >/dev/null 2>&1 || true
 	done
 	if [ -d /run/systemd/system ]; then
+		systemctl stop persona-dns.service >/dev/null 2>&1 || true
+		systemctl disable persona-dns.service >/dev/null 2>&1 || true
 		systemctl stop persona-netns.service >/dev/null 2>&1 || true
 		systemctl disable persona-netns.service >/dev/null 2>&1 || true
 	fi

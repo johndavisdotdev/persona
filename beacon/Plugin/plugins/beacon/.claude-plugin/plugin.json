@@ -1,0 +1,17 @@
+{
+  "name": "beacon",
+  "displayName": "Persona beacon",
+  "version": "@VERSION@",
+  "description": "Discover and message the other persona agents on this machine, and reach the persona host",
+  "author": {
+    "name": "John Davis"
+  },
+  "repository": "https://github.com/johndavisdotdev/persona",
+  "keywords": ["persona", "multicast", "agents", "channel"],
+  "channels": [
+    {
+      "server": "persona-beacon",
+      "displayName": "Persona agents"
+    }
+  ]
+}

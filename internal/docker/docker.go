@@ -56,28 +56,6 @@ func Available(ctx context.Context) error {
 	return nil
 }
 
-// Build builds the persona image, streaming progress to w.
-func Build(ctx context.Context, name string, noCache bool, w io.Writer) error {
-	args := []string{"build", "--progress=plain", "-t", persona.ImageFor(name), "-f", persona.DockerfilePath(name)}
-	if noCache {
-		args = append(args, "--no-cache")
-	}
-	token := githubToken(ctx)
-	if token != "" {
-		args = append(args, "--secret", "id=github_token,env=PERSONA_GITHUB_TOKEN")
-	}
-	args = append(args, persona.Dir(name))
-	cmd := Command(ctx, args...)
-	if token != "" {
-		cmd.Env = append(cmd.Env, "PERSONA_GITHUB_TOKEN="+token)
-	}
-	cmd.Stdout, cmd.Stderr = w, w
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker build failed for %s: %w", name, err)
-	}
-	return nil
-}
-
 // ImageExists reports whether the image tag exists locally.
 func ImageExists(ctx context.Context, tag string) bool {
 	return Command(ctx, "image", "inspect", tag).Run() == nil
@@ -92,11 +70,15 @@ func RemoveImage(ctx context.Context, tag string) error {
 	return err
 }
 
+// StatusMount is where a container sees its status directory (see package status).
+const StatusMount = "/run/persona-status"
+
 // RunOptions configures a new persona container.
 type RunOptions struct {
 	Persona    string
 	Instance   string
 	Workdir    string   // host directory mounted at /workspace; empty for none
+	StatusDir  string   // host directory for the status stream, mounted at StatusMount
 	Env        []string // NAME (forwarded from host) or NAME=VALUE
 	ClaudeArgs string
 	Prompt     string
@@ -120,6 +102,9 @@ func Run(ctx context.Context, o RunOptions) (string, error) {
 	}
 	if o.Workdir != "" {
 		args = append(args, "--mount", "type=bind,source="+o.Workdir+",target=/workspace")
+	}
+	if o.StatusDir != "" {
+		args = append(args, "--mount", "type=bind,source="+o.StatusDir+",target="+StatusMount)
 	}
 	for _, e := range o.Env {
 		args = append(args, "-e", e)
@@ -150,6 +135,11 @@ type Container struct {
 	Status   string
 	Image    string
 	Created  string
+	// Namespace is the persona network namespace (microVMs; Docker
+	// containers are all in "default").
+	Namespace string
+	// IP is a microVM's address on its namespace's bridge.
+	IP string `json:",omitempty"`
 }
 
 // Running reports whether the container is running.
@@ -269,4 +259,38 @@ func githubToken(ctx context.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// Start starts a stopped container.
+func Start(ctx context.Context, name string) error {
+	_, err := output(ctx, "start", name)
+	return err
+}
+
+// Commit saves a container's filesystem as image tag, with Dockerfile-style
+// config changes (e.g. "LABEL a=b"). The container keeps running.
+func Commit(ctx context.Context, container, tag string, changes []string) error {
+	args := []string{"commit"}
+	for _, c := range changes {
+		args = append(args, "--change", c)
+	}
+	_, err := output(ctx, append(args, container, tag)...)
+	return err
+}
+
+// Import creates image tag from a root filesystem tarball read from r, with
+// Dockerfile-style config changes (USER, ENV, ENTRYPOINT, LABEL, ...).
+func Import(ctx context.Context, r io.Reader, tag string, changes []string) error {
+	args := []string{"import"}
+	for _, c := range changes {
+		args = append(args, "--change", c)
+	}
+	cmd := Command(ctx, append(args, "-", tag)...)
+	cmd.Stdin = r
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker import: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }

@@ -123,7 +123,7 @@ func (c *Client) RunTools(ctx context.Context, system, user string, tools []Tool
 				return errors.New("model response was truncated (max_tokens)")
 			}
 			// Nudge the model to finish via the submit tool.
-			msgs = append(msgs, message{Role: "user", Content: "Please finish by calling the submit_persona tool."})
+			msgs = append(msgs, message{Role: "user", Content: "Please finish by calling your submit tool."})
 			continue
 		}
 		msgs = append(msgs, message{Role: "user", Content: results})

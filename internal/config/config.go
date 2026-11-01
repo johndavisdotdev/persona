@@ -18,11 +18,14 @@ const (
 	KeyAnthropicAPIKey = "anthropic_api_key"
 	KeyAnthropicURL    = "anthropic_base_url"
 	KeyExaAPIKey       = "exa_api_key"
-	KeyMarketplaces    = "marketplaces"
-	KeyBaseImage       = "base_image"
-	KeyEditor          = "editor"
-	KeyDockerBin       = "docker"
-	KeyForwardEnv      = "forward_env"
+	// KeyOpenRouterAPIKey is forwarded to spawns as OPENROUTER_API_KEY (the
+	// pi harness reaches models through OpenRouter).
+	KeyOpenRouterAPIKey = "openrouter_api_key"
+	KeyMarketplaces     = "marketplaces"
+	KeyBaseImage        = "base_image"
+	KeyEditor           = "editor"
+	KeyDockerBin        = "docker"
+	KeyForwardEnv       = "forward_env"
 	// KeyRuntime selects where instances run: "firecracker" (microVMs; the
 	// default on Linux, needs KVM and the persona .deb) or "docker"
 	// (containers; the default elsewhere).
@@ -31,6 +34,20 @@ const (
 	KeyVMVCPUs  = "vm_vcpus"
 	KeyVMMemory = "vm_memory_mib"
 	KeyVMDisk   = "vm_disk_gib" // size of each VM's writable layer (sparse)
+	// KeyNixpkgs is the nixpkgs branch or revision new persona flakes follow
+	// (each persona's flake.lock then pins it until `persona update --refresh`).
+	KeyNixpkgs = "nixpkgs"
+	// KeyNixImage is the container that builds flakes when the host has no Nix.
+	KeyNixImage = "nix_image"
+	// KeyNixBuilder picks where flakes build: auto (host Nix if present,
+	// else a container), host, or container.
+	KeyNixBuilder = "nix_builder"
+	// KeyBeaconMarketplace is the published Claude Code marketplace "persona"
+	// (plugin "beacon", from beacon/) that every image gets.
+	KeyBeaconMarketplace = "beacon_marketplace"
+	// KeyManagedSettings is Claude Code's managed-settings.json, installed at
+	// /etc/claude-code/managed-settings.json in Claude Code personas.
+	KeyManagedSettings = "claude_managed_settings"
 )
 
 // DefaultMarketplaces are the built-in marketplaces the AI always searches.
@@ -56,16 +73,22 @@ func Init(cfgFile, home string) error {
 	viper.SetDefault(KeyMarketplaces, DefaultMarketplaces)
 	viper.SetDefault(KeyBaseImage, "debian:trixie-slim")
 	viper.SetDefault(KeyDockerBin, "docker")
-	viper.SetDefault(KeyForwardEnv, []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"})
+	viper.SetDefault(KeyForwardEnv, []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY"})
 	viper.SetDefault(KeyRuntime, DefaultRuntime())
 	viper.SetDefault(KeyVMKernel, "/usr/share/persona/vmlinux")
 	viper.SetDefault(KeyVMVCPUs, 2)
 	viper.SetDefault(KeyVMMemory, 4096)
 	viper.SetDefault(KeyVMDisk, 32)
+	viper.SetDefault(KeyNixpkgs, "nixos-unstable")
+	viper.SetDefault(KeyNixImage, "nixos/nix:latest")
+	viper.SetDefault(KeyNixBuilder, "auto")
+	viper.SetDefault(KeyBeaconMarketplace, "/usr/share/persona/marketplace")
+	viper.SetDefault(KeyManagedSettings, "/usr/share/persona/managed-settings.json")
 
 	// Fall back to the conventional, unprefixed env vars for API keys.
 	_ = viper.BindEnv(KeyAnthropicAPIKey, "PERSONA_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")
 	_ = viper.BindEnv(KeyExaAPIKey, "PERSONA_EXA_API_KEY", "EXA_API_KEY")
+	_ = viper.BindEnv(KeyOpenRouterAPIKey, "PERSONA_OPENROUTER_API_KEY", "OPENROUTER_API_KEY")
 	_ = viper.BindEnv(KeyEditor, "PERSONA_EDITOR", "VISUAL", "EDITOR")
 
 	if cfgFile != "" {

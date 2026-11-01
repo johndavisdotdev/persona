@@ -43,7 +43,7 @@ func TestKernelArgsAndIdentity(t *testing.T) {
 	if got := MAC(ip); got != "06:00:0a:c8:03:04" {
 		t.Errorf("MAC = %s", got)
 	}
-	want := "init=/sbin/persona-agent ip=10.200.3.4::10.200.0.1:255.255.0.0:vm1:eth0:off:1.1.1.1:8.8.8.8"
+	want := "init=/sbin/persona-agent ip=10.200.3.4::10.200.0.1:255.255.0.0:vm1:eth0:off:10.200.0.1:1.1.1.1" // persona-dns, then a public resolver
 	if got := KernelArgs(ip, "vm1"); !strings.HasSuffix(got, want) {
 		t.Errorf("KernelArgs = %s", got)
 	}
@@ -144,7 +144,7 @@ func buildGuest(ctx context.Context, assets string) (string, error) {
 		os.Remove(o)
 	}
 	return out, ExportRootfs(ctx, "docker", "persona-test-guest", out,
-		map[string]File{AgentPath: {Data: agentData, Mode: 0o755}})
+		map[string]File{AgentPath: {Data: agentData, Mode: 0o755}}, nil)
 }
 
 func (e *env) start(id string, ip net.IP) *VM {

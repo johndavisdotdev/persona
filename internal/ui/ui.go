@@ -89,10 +89,23 @@ func RenderPersona(p *persona.Persona) string {
 	for _, x := range p.Skills {
 		sk = append(sk, Bold.Render(x.Name)+Dim.Render(" "+x.Repo+"/"+x.Path)+reason(x.Reason))
 	}
+	var tc []string
+	for _, x := range p.Toolchains {
+		how := ""
+		switch {
+		case x.Nix != "":
+			how = " nixpkgs#" + x.Nix
+		case x.Install != "":
+			how = " from " + x.Source
+		}
+		tc = append(tc, Bold.Render(x.String())+Dim.Render(how)+reason(x.Reason))
+	}
+	section("Toolchains", tc)
 	section("Plugins", pl)
 	section("MCP servers", mcp)
 	section("Skills", sk)
-	section("Extra packages", p.AptPackages)
+	section("Packages (nixpkgs)", p.Packages)
+	section("Packages (apt, mapped to nixpkgs)", p.AptPackages)
 	section("Forwarded env", p.Env)
 	return Box.Render(strings.TrimRight(b.String(), "\n"))
 }

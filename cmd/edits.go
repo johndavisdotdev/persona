@@ -20,8 +20,13 @@ import (
 type componentEdits struct {
 	addPlugins, rmPlugins, addMarketplaces, rmMCP []string
 	addEnv, rmEnv, addApt, rmApt                  []string
-	model                                         string
-	modelSet                                      bool
+	addToolchains, rmToolchains                   []string
+	addHarnessPkgs, rmHarnessPkgs                 []string
+	model, harness                                string
+	modelSet, harnessSet                          bool
+	// base is set when editing the base requirements, whose package list is
+	// absolute rather than relative to it.
+	base bool
 }
 
 func (e *componentEdits) register(f *pflag.FlagSet) {
@@ -31,15 +36,21 @@ func (e *componentEdits) register(f *pflag.FlagSet) {
 	f.StringSliceVar(&e.rmMCP, "remove-mcp", nil, "remove MCP server by name")
 	f.StringSliceVar(&e.addEnv, "add-env", nil, "forward a host env var into spawned containers")
 	f.StringSliceVar(&e.rmEnv, "remove-env", nil, "stop forwarding a host env var")
-	f.StringSliceVar(&e.addApt, "add-apt", nil, "add a Debian package")
-	f.StringSliceVar(&e.rmApt, "remove-apt", nil, "remove a Debian package")
-	f.StringVar(&e.model, "model", "", "Claude Code model inside the container (opus, sonnet, haiku, or a model id; empty for default)")
+	f.StringSliceVar(&e.addApt, "add-package", nil, "add a nixpkgs package (attribute name, e.g. ffmpeg)")
+	f.StringSliceVar(&e.rmApt, "remove-package", nil, "remove a nixpkgs package (or a legacy apt package)")
+	f.StringSliceVar(&e.addToolchains, "add-toolchain", nil, "add a language toolchain (name or name@version; one of "+strings.Join(persona.ToolchainNames(), ", ")+")")
+	f.StringSliceVar(&e.rmToolchains, "remove-toolchain", nil, "remove a language toolchain by name")
+	f.StringVar(&e.model, "model", "", "harness model: opus, sonnet or haiku for Claude Code; an OpenRouter model id (e.g. anthropic/claude-sonnet-4.5) for pi; empty for default")
+	f.StringVar(&e.harness, "harness", "", "coding agent for spawns: "+strings.Join(persona.Harnesses, " or ")+" (empty: the default)")
+	f.StringSliceVar(&e.addHarnessPkgs, "add-harness-package", nil, "add a pi package (npm:<name>)")
+	f.StringSliceVar(&e.rmHarnessPkgs, "remove-harness-package", nil, "remove a pi package, including a default one (npm:<name>)")
 }
 
 func (e *componentEdits) any(f *pflag.FlagSet) bool {
 	e.modelSet = f.Changed("model")
-	return e.modelSet || len(e.addPlugins)+len(e.rmPlugins)+len(e.addMarketplaces)+len(e.rmMCP)+
-		len(e.addEnv)+len(e.rmEnv)+len(e.addApt)+len(e.rmApt) > 0
+	e.harnessSet = f.Changed("harness")
+	return e.modelSet || e.harnessSet || len(e.addHarnessPkgs)+len(e.rmHarnessPkgs) > 0 || len(e.addPlugins)+len(e.rmPlugins)+len(e.addMarketplaces)+len(e.rmMCP)+
+		len(e.addEnv)+len(e.rmEnv)+len(e.addApt)+len(e.rmApt)+len(e.addToolchains)+len(e.rmToolchains) > 0
 }
 
 func (e *componentEdits) apply(ctx context.Context, p *persona.Persona, out io.Writer) error {
@@ -83,8 +94,51 @@ func (e *componentEdits) apply(ctx context.Context, p *persona.Persona, out io.W
 	}
 	p.Env = append(p.Env, e.addEnv...)
 	p.Env = slices.DeleteFunc(p.Env, func(s string) bool { return slices.Contains(e.rmEnv, s) })
-	p.AptPackages = append(p.AptPackages, e.addApt...)
+	for _, pk := range e.addApt {
+		if err := persona.ValidateNixPackage(pk); err != nil {
+			return err
+		}
+	}
+	p.Packages = append(p.Packages, e.addApt...)
+	p.Packages = slices.DeleteFunc(p.Packages, func(s string) bool { return slices.Contains(e.rmApt, s) })
 	p.AptPackages = slices.DeleteFunc(p.AptPackages, func(s string) bool { return slices.Contains(e.rmApt, s) })
+	if e.harnessSet {
+		if err := persona.ValidateHarness(e.harness); err != nil {
+			return err
+		}
+		p.Harness = e.harness
+	}
+	for _, pk := range append(append([]string{}, e.addHarnessPkgs...), e.rmHarnessPkgs...) {
+		if err := persona.ValidateHarnessPackage(pk); err != nil || strings.HasPrefix(pk, "-") {
+			return fmt.Errorf("invalid pi package %q (use npm:<name>)", pk)
+		}
+	}
+	for _, pk := range e.addHarnessPkgs {
+		p.HarnessPackages = slices.DeleteFunc(p.HarnessPackages, func(x string) bool { return x == "-"+pk })
+		if !slices.Contains(p.HarnessPackages, pk) {
+			p.HarnessPackages = append(p.HarnessPackages, pk)
+		}
+	}
+	for _, pk := range e.rmHarnessPkgs {
+		had := slices.Contains(p.HarnessPackages, pk)
+		p.HarnessPackages = slices.DeleteFunc(p.HarnessPackages, func(x string) bool { return x == pk })
+		if !had && !e.base && !slices.Contains(p.HarnessPackages, "-"+pk) {
+			p.HarnessPackages = append(p.HarnessPackages, "-"+pk) // drop the base's
+		}
+	}
+	p.Toolchains = slices.DeleteFunc(p.Toolchains, func(t persona.Toolchain) bool { return slices.Contains(e.rmToolchains, t.Name) })
+	for _, s := range e.addToolchains {
+		t, err := persona.ParseToolchain(s)
+		if err != nil {
+			return err
+		}
+		if t.Custom() {
+			return fmt.Errorf("toolchain %q isn't built in; describe it with `persona update --description` or add it to persona.yaml with `persona edit --spec`", t.Name)
+		}
+		// Replace an existing entry so --add-toolchain dotnet@8 changes the version.
+		p.Toolchains = slices.DeleteFunc(p.Toolchains, func(x persona.Toolchain) bool { return x.Name == t.Name })
+		p.Toolchains = append(p.Toolchains, t)
+	}
 	if e.modelSet {
 		p.Model = e.model
 	}

@@ -17,11 +17,11 @@ import (
 )
 
 func newListCmd() *cobra.Command {
-	var asJSON, instances bool
+	var asJSON bool
 	cmd := &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"ls"},
-		Short:   "List configured personas (or running instances with -i)",
+		Short:   "List personas (spawns: persona ps)",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, out := cmd.Context(), cmd.OutOrStdout()
@@ -34,29 +34,6 @@ func newListCmd() *cobra.Command {
 				if cs, err = rt.List(ctx, ""); err != nil {
 					return err
 				}
-			}
-
-			if instances {
-				if rtErr != nil {
-					return rtErr
-				}
-				if asJSON {
-					return json.NewEncoder(out).Encode(cs)
-				}
-				if len(cs) == 0 {
-					fmt.Fprintln(out, ui.Dim.Render("No persona instances. Start one with `persona spawn <persona>`."))
-					return nil
-				}
-				t := newTable("INSTANCE", "PERSONA", "STATE", "STATUS")
-				for _, c := range cs {
-					state := c.State
-					if c.Running() {
-						state = ui.OK.Render(state)
-					}
-					t.Row(c.Name, c.Persona, state, c.Status)
-				}
-				fmt.Fprintln(out, t)
-				return nil
 			}
 
 			ps, errs := persona.List()
@@ -94,7 +71,11 @@ func newListCmd() *cobra.Command {
 						img = ui.OK.Render("built")
 					}
 				}
-				if edited, _ := p.EditedFiles(); len(edited) > 0 {
+				if p.Saved() {
+					img += ui.Dim.Render(" (saved)")
+				} else if p.Customized != nil {
+					img += ui.Dim.Render(" (customized)")
+				} else if edited, _ := p.EditedFiles(); len(edited) > 0 {
 					img += ui.Dim.Render(" (custom)")
 				}
 				run := ui.Dim.Render("0")
@@ -112,7 +93,6 @@ func newListCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "output JSON")
-	cmd.Flags().BoolVarP(&instances, "instances", "i", false, "list spawned containers instead of personas")
 	return cmd
 }
 

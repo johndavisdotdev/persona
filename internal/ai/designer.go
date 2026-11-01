@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -23,31 +24,61 @@ type Designer struct {
 	// Preinstalled lists plugin ids every persona already gets from the base
 	// settings and base requirements; the model should not duplicate them.
 	Preinstalled []string
-	// Progress receives human-readable status lines as the agent works.
+	// Harness is the default harness (the base's, else persona.DefaultHarness)
+	// for descriptions that don't ask for one.
+	Harness string
+	// Progress receives human-readable status lines as the agents work.
 	Progress func(string)
+	mu       sync.Mutex
 }
 
 func (d *Designer) progress(format string, a ...any) {
 	if d.Progress != nil {
+		d.mu.Lock()
+		defer d.mu.Unlock()
 		d.Progress(fmt.Sprintf(format, a...))
 	}
 }
 
-const designerSystem = `You are persona-architect. You design "personas": minimal Debian containers running Claude Code, pre-configured with exactly the plugins, skills, and MCP servers a described role needs.
+var designerSystem = `You are persona-architect. You design "personas": minimal containers, built with Nix, running a coding agent (the harness: Claude Code by default, or pi), pre-configured with exactly the plugins, skills, MCP servers and toolchains a described role needs.
 
 Process:
-1. Interpret the user's persona description: the role, domain, daily tasks, and tools they will touch.
+1. Interpret the user's persona description: the role, domain, daily tasks, and tools they will touch. Then put yourself in that agent's position on day one: what must already be installed for you to succeed at this job without asking anyone? Languages and their SDKs, build tools, test runners, browsers, database clients, cloud CLIs. Infer all of this from the prose; the user will not list toolchains, and you never ask them.
 2. Use search_plugins with several focused queries (domain terms, tool names, task verbs) across the built-in marketplaces.
 3. If web_search is available, look for niche third-party Claude Code plugin marketplaces (GitHub repos containing .claude-plugin/marketplace.json) and MCP servers relevant to the domain. Verify any candidate marketplace with inspect_marketplace before using its plugins. Use read_url to check an MCP server's README for its exact launch command.
-4. Call submit_persona exactly once with your final selection.
+4. Choose toolchains (see Toolchains below).
+5. Call submit_persona with your final selection.
 
 Selection rules:
 - Be minimal and precise. Every plugin, MCP server, and skill must clearly serve the persona; prefer 3-10 high-signal items over long lists. Each needs a one-line reason.
 - Plugins must be referenced as name@marketplace and must exist in a marketplace you searched or inspected.
 - Prefer remote (http) MCP servers when an official one exists; otherwise stdio launched via npx (Node) or uvx (Python). Never invent package names: only use commands you saw documented.
 - Secrets are never hard-coded. Reference them as ${VAR_NAME} in MCP env/headers and list VAR_NAME in env so the host forwards it at spawn time.
-- Only add apt_packages for CLI tools the persona genuinely needs (e.g. postgresql-client, python3, golang).
-- instructions becomes the container's CLAUDE.md: write a focused operating guide in second person (role, priorities, conventions, how to use the installed tools). 150-400 words.`
+- Use packages for other CLI tools, as nixpkgs attribute names (e.g. postgresql for psql, sqlite, graphviz, ffmpeg, shellcheck, awscli2). Never use packages for language runtimes; use toolchains.
+- instructions becomes the container's CLAUDE.md: write a focused operating guide in second person (role, priorities, conventions, how to use the installed tools). 150-400 words.
+
+Harness (the coding agent the persona's spawns run):
+- claude (the default): Claude Code.
+- pi: the pi coding agent (https://pi.dev), reaching models through OpenRouter. Choose it only when the description asks for pi. It gets these pi packages by default: @PIPACKAGES@. Add more in harness_packages as "npm:<name>" only when the role clearly benefits and you verified the package is a pi package (its npm metadata has the "pi-package" keyword; check https://registry.npmjs.org/<name> with read_url). Remove a default with "-npm:<name>" only if the description asks.
+- Claude Code plugins only work with the claude harness: for pi, leave plugins empty. Skills, MCP servers, toolchains and packages work with both.
+- If the description names a model, set model: a Claude Code alias (opus, sonnet, haiku) for claude, or an OpenRouter model id (e.g. anthropic/claude-sonnet-4.5) for pi.
+
+Toolchains (language SDKs and runtimes, from nixpkgs; persona picks the newest stable version of each):
+- Every language, framework, or ecosystem the persona works in needs its toolchain: a .NET/C#/ASP.NET/Blazor expert gets dotnet; Rust gets rust; Go gets go; Java/Kotlin/Spring/Gradle gets java; Python/data/ML gets python; Node/TypeScript gets node (bun or deno only when mentioned). Frameworks imply their language.
+- Anything web-oriented (a website, web app, frontend, React/Vue/Angular/Svelte/Next.js, HTML/CSS, full-stack, browser or end-to-end testing) gets the playwright toolchain, which brings Node.js, the Playwright CLI with Chromium, its skills, and the playwright plugin. Mention in instructions that playwright-cli can drive a real browser to verify UI work.
+- Leave version empty for the default (latest stable; LTS for node and java) unless the description names a version ("NET 8", "Python 3.11", "Go 1.22").
+- Built-in toolchains (just give name, version and reason):
+@TOOLCHAINS@
+- Any other runtime (Zig, Elixir/Erlang, Haskell, OCaml, Julia, Swift, Dart/Flutter, …) is a custom toolchain: set nix to its nixpkgs attribute (e.g. zig, elixir, ghc, ocaml, julia). Images are built with Nix, so that is the install. Only for a runtime nixpkgs doesn't have, if web_search is available, find its primary source (official site or download page, not a blog) and write install: root shell commands from it for a Nix-based image with no apt (curl, tar, unzip and xz are there): detect the architecture with uname -m, download from the official URL, verify a published checksum when there is one, install under /opt or /usr/local, list any bin directory in path, and set source to the page you used.`
+
+func init() {
+	var lines []string
+	for _, t := range persona.ToolchainCatalog {
+		lines = append(lines, fmt.Sprintf("  - %s: %s (default: %s)", t.Name, t.Summary, t.Default))
+	}
+	designerSystem = strings.Replace(designerSystem, "@TOOLCHAINS@", strings.Join(lines, "\n"), 1)
+	designerSystem = strings.Replace(designerSystem, "@PIPACKAGES@", strings.Join(persona.DefaultPiPackages, ", "), 1)
+}
 
 func (d *Designer) tools() []Tool {
 	str := map[string]any{"type": "string"}
@@ -93,8 +124,20 @@ func (d *Designer) tools() []Tool {
 					"path": map[string]any{"type": "string", "description": "Directory of the skill (containing SKILL.md) within the repo"},
 					"ref":  str, "reason": str,
 				}, "name", "repo", "path", "reason")},
-				"apt_packages": strArr,
-				"env":          map[string]any{"type": "array", "items": str, "description": "Host environment variable names to forward into the container."},
+				"packages": map[string]any{"type": "array", "items": str, "description": "nixpkgs attribute names of CLIs the role uses."},
+				"harness":  map[string]any{"type": "string", "enum": persona.Harnesses, "description": "The coding agent: claude (default) or pi (only when the description asks for pi)."},
+				"harness_packages": map[string]any{"type": "array", "items": str,
+					"description": "pi only: extra pi packages (npm:<name>) beyond the defaults; -npm:<name> removes a default."},
+				"toolchains": map[string]any{"type": "array", "description": "Language SDKs/runtimes the persona needs.", "items": obj(map[string]any{
+					"name":    map[string]any{"type": "string", "description": "A built-in toolchain name, or a lowercase name for a custom runtime."},
+					"version": map[string]any{"type": "string", "description": "Only when the description names one; empty for the default."},
+					"reason":  str,
+					"source":  map[string]any{"type": "string", "description": "Custom installs only: https URL of the primary source the install commands come from."},
+					"install": map[string]any{"type": "string", "description": "Only for runtimes nixpkgs lacks: root shell commands from the primary source (Nix-based image, no apt). $VERSION holds the version."},
+					"nix":     map[string]any{"type": "string", "description": "Custom toolchains: the nixpkgs attribute."},
+					"path":    map[string]any{"type": "array", "items": str, "description": "Custom installs only: directories to add to PATH."},
+				}, "name", "reason")},
+				"env": map[string]any{"type": "array", "items": str, "description": "Host environment variable names to forward into the container."},
 			}, "summary", "instructions", "plugins", "mcp_servers", "skills"),
 		},
 	}
@@ -122,8 +165,11 @@ type submission struct {
 	} `json:"plugins"`
 	MCPServers  []persona.MCPServer `json:"mcp_servers"`
 	Skills      []persona.Skill     `json:"skills"`
-	AptPackages []string            `json:"apt_packages"`
+	Packages    []string            `json:"packages"`
+	Toolchains  []persona.Toolchain `json:"toolchains"`
 	Env         []string            `json:"env"`
+	Harness     string              `json:"harness"`
+	HarnessPkgs []string            `json:"harness_packages"`
 }
 
 const baseSystemAddendum = `
@@ -142,9 +188,10 @@ func (d *Designer) DesignBase(ctx context.Context, requirement string, current *
 	return &nb, p.Summary, nil
 }
 
-// Design produces a persona. If prev is non-nil, the model revises it.
+// Design produces a persona with three specialist agents working in
+// parallel (see designParallel). If prev is non-nil, they revise it.
 func (d *Designer) Design(ctx context.Context, name, description string, prev *persona.Persona) (*persona.Persona, error) {
-	return d.design(ctx, name, description, prev, false)
+	return d.designParallel(ctx, name, description, prev)
 }
 
 func (d *Designer) design(ctx context.Context, name, description string, prev *persona.Persona, baseMode bool) (*persona.Persona, error) {
@@ -182,71 +229,12 @@ func (d *Designer) design(ctx context.Context, name, description string, prev *p
 	}
 
 	var result *persona.Persona
+	nudged := false
 	handler := func(ctx context.Context, tool string, input json.RawMessage) (string, bool, error) {
+		if out, handled, err := d.researchTool(ctx, "", tool, input); handled {
+			return out, false, err
+		}
 		switch tool {
-		case "search_plugins":
-			var in struct {
-				Query, Marketplace string
-				Limit              int
-			}
-			if err := json.Unmarshal(input, &in); err != nil {
-				return "", false, err
-			}
-			d.progress("Searching plugins: %q", in.Query)
-			hits := d.Catalog.Search(in.Query, in.Marketplace, in.Limit)
-			if len(hits) == 0 {
-				return "No matching plugins.", false, nil
-			}
-			out, _ := json.Marshal(hits)
-			return string(out), false, nil
-
-		case "inspect_marketplace":
-			var in struct{ Source string }
-			if err := json.Unmarshal(input, &in); err != nil {
-				return "", false, err
-			}
-			d.progress("Inspecting marketplace %s", in.Source)
-			m, err := d.Catalog.Load(ctx, in.Source)
-			if err != nil {
-				return "", false, err
-			}
-			var lines []string
-			for i, p := range m.Plugins {
-				if i == 60 {
-					lines = append(lines, fmt.Sprintf("… and %d more (use search_plugins with marketplace=%q)", len(m.Plugins)-60, m.Name))
-					break
-				}
-				lines = append(lines, fmt.Sprintf("%s@%s: %s", p.Name, m.Name, truncate(p.Description, 160)))
-			}
-			return fmt.Sprintf("Marketplace %q (source %s) loaded with %d plugins:\n%s", m.Name, m.Source, len(m.Plugins), strings.Join(lines, "\n")), false, nil
-
-		case "web_search":
-			var in struct {
-				Query      string
-				NumResults int `json:"num_results"`
-			}
-			if err := json.Unmarshal(input, &in); err != nil {
-				return "", false, err
-			}
-			d.progress("Exa search: %q", in.Query)
-			res, err := d.Exa.Search(ctx, in.Query, in.NumResults)
-			if err != nil {
-				return "", false, err
-			}
-			for i := range res {
-				res[i].Text = truncate(res[i].Text, 700)
-			}
-			out, _ := json.Marshal(res)
-			return string(out), false, nil
-
-		case "read_url":
-			var in struct{ URL string }
-			if err := json.Unmarshal(input, &in); err != nil {
-				return "", false, err
-			}
-			d.progress("Reading %s", in.URL)
-			return d.readURL(ctx, in.URL)
-
 		case "submit_persona":
 			var s submission
 			if err := json.Unmarshal(input, &s); err != nil {
@@ -257,8 +245,29 @@ func (d *Designer) design(ctx context.Context, name, description string, prev *p
 				d.progress("Rejected submission: %v", err)
 				return "", false, err
 			}
+			// Once, point out toolchains the description implies but the
+			// submission lacks; the model decides.
+			if !baseMode && !nudged {
+				nudged = true
+				if missing := MissingToolchains(description, p.Toolchains); len(missing) > 0 {
+					d.progress("Asking the designer to reconsider toolchains: %s", strings.Join(missing, ", "))
+					return "Not accepted yet. The description mentions " + strings.Join(missing, "; ") +
+						", but toolchains doesn't include it. Add the toolchain(s) and call submit_persona again; if one truly isn't needed, call submit_persona again unchanged.", false, nil
+				}
+			}
+			if !baseMode {
+				// Every language the description mentions is installed.
+				if added := EnsureMentioned(description, p); len(added) > 0 {
+					d.progress("Added what the description mentions: %s", strings.Join(added, ", "))
+				}
+				if h := MentionedHarness(description); h != "" && h != p.Harness {
+					d.progress("Using the %s harness, as the description asks", h)
+					p.Harness = h
+				}
+				p.Normalize()
+			}
 			result = p
-			d.progress("Design complete: %d plugins, %d MCP servers, %d skills", len(p.Plugins), len(p.MCPServers), len(p.Skills))
+			d.progress("Design complete: %d plugins, %d MCP servers, %d skills, %d toolchains", len(p.Plugins), len(p.MCPServers), len(p.Skills), len(p.Toolchains))
 			return "Persona accepted.", true, nil
 		}
 		return "", false, fmt.Errorf("unknown tool %q", tool)
@@ -276,6 +285,79 @@ func (d *Designer) design(ctx context.Context, name, description string, prev *p
 		return nil, errors.New("the model did not submit a persona")
 	}
 	return result, nil
+}
+
+// researchTool runs the tools all designer agents share: plugin search,
+// marketplace inspection, web search and reading pages. label prefixes
+// progress lines (the agent's name, when several run at once).
+func (d *Designer) researchTool(ctx context.Context, label, tool string, input json.RawMessage) (string, bool, error) {
+	say := func(format string, a ...any) { d.progress(label+format, a...) }
+	switch tool {
+	case "search_plugins":
+		var in struct {
+			Query, Marketplace string
+			Limit              int
+		}
+		if err := json.Unmarshal(input, &in); err != nil {
+			return "", true, err
+		}
+		say("Searching plugins: %q", in.Query)
+		hits := d.Catalog.Search(in.Query, in.Marketplace, in.Limit)
+		if len(hits) == 0 {
+			return "No matching plugins.", true, nil
+		}
+		out, _ := json.Marshal(hits)
+		return string(out), true, nil
+
+	case "inspect_marketplace":
+		var in struct{ Source string }
+		if err := json.Unmarshal(input, &in); err != nil {
+			return "", true, err
+		}
+		say("Inspecting marketplace %s", in.Source)
+		m, err := d.Catalog.Load(ctx, in.Source)
+		if err != nil {
+			return "", true, err
+		}
+		var lines []string
+		for i, p := range m.Plugins {
+			if i == 60 {
+				lines = append(lines, fmt.Sprintf("… and %d more (use search_plugins with marketplace=%q)", len(m.Plugins)-60, m.Name))
+				break
+			}
+			lines = append(lines, fmt.Sprintf("%s@%s: %s", p.Name, m.Name, truncate(p.Description, 160)))
+		}
+		return fmt.Sprintf("Marketplace %q (source %s) loaded with %d plugins:\n%s", m.Name, m.Source, len(m.Plugins), strings.Join(lines, "\n")), true, nil
+
+	case "web_search":
+		var in struct {
+			Query      string
+			NumResults int `json:"num_results"`
+		}
+		if err := json.Unmarshal(input, &in); err != nil {
+			return "", true, err
+		}
+		say("Exa search: %q", in.Query)
+		res, err := d.Exa.Search(ctx, in.Query, in.NumResults)
+		if err != nil {
+			return "", true, err
+		}
+		for i := range res {
+			res[i].Text = truncate(res[i].Text, 700)
+		}
+		out, _ := json.Marshal(res)
+		return string(out), true, nil
+
+	case "read_url":
+		var in struct{ URL string }
+		if err := json.Unmarshal(input, &in); err != nil {
+			return "", true, err
+		}
+		say("Reading %s", in.URL)
+		out, _, err := d.readURL(ctx, in.URL)
+		return out, true, err
+	}
+	return "", false, nil
 }
 
 func (d *Designer) readURL(ctx context.Context, url string) (string, bool, error) {
@@ -297,18 +379,21 @@ func (d *Designer) readURL(ctx context.Context, url string) (string, bool, error
 // toPersona validates a submission against the catalog and builds the spec.
 func (d *Designer) toPersona(name, description string, s submission, prev *persona.Persona, baseMode bool) (*persona.Persona, error) {
 	p := &persona.Persona{
-		Name:         name,
-		Description:  description,
-		Summary:      strings.TrimSpace(s.Summary),
-		Instructions: strings.TrimSpace(s.Instructions),
-		Model:        s.Model,
-		MCPServers:   s.MCPServers,
-		Skills:       s.Skills,
-		AptPackages:  s.AptPackages,
-		Env:          s.Env,
+		Name:            name,
+		Description:     description,
+		Summary:         strings.TrimSpace(s.Summary),
+		Instructions:    strings.TrimSpace(s.Instructions),
+		Model:           s.Model,
+		MCPServers:      s.MCPServers,
+		Skills:          s.Skills,
+		Packages:        s.Packages,
+		Toolchains:      s.Toolchains,
+		Env:             s.Env,
+		Harness:         s.Harness,
+		HarnessPackages: s.HarnessPkgs,
 	}
 	if prev != nil {
-		p.CreatedAt, p.BaseImage, p.DockerfileHash = prev.CreatedAt, prev.BaseImage, prev.DockerfileHash
+		p.CreatedAt, p.FileHashes = prev.CreatedAt, prev.FileHashes
 	}
 	var problems []string
 	usedMP := map[string]bool{}
@@ -346,6 +431,19 @@ func (d *Designer) toPersona(name, description string, s submission, prev *perso
 	for _, sk := range p.Skills {
 		if persona.ValidateName(sk.Name) != nil {
 			problems = append(problems, fmt.Sprintf("skill name %q must be lowercase letters, digits, and dashes", sk.Name))
+		}
+	}
+	for _, t := range p.Toolchains {
+		if err := persona.ValidateToolchain(t); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
+	if err := persona.ValidateHarness(p.Harness); err != nil {
+		problems = append(problems, err.Error())
+	}
+	for _, pk := range p.HarnessPackages {
+		if err := persona.ValidateHarnessPackage(pk); err != nil {
+			problems = append(problems, err.Error())
 		}
 	}
 	if p.Instructions == "" && !baseMode {

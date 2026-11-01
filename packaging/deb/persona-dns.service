@@ -1,0 +1,12 @@
+[Unit]
+Description=DNS for persona microVMs: spawn names in each namespace, public DNS for the rest
+After=persona-netns.service
+Wants=persona-netns.service
+
+[Service]
+ExecStart=/usr/libexec/persona/persona-vm dns
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

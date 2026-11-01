@@ -32,32 +32,54 @@ func newDesigner(useExa bool, out io.Writer) *ai.Designer {
 		Preinstalled: preinstalledPlugins(),
 		Progress:     func(s string) { ui.Step(out, s) },
 	}
+	if b, err := persona.LoadBase(); err == nil {
+		d.Harness = persona.EffectiveHarness(&persona.Persona{}, b)
+	}
 	if useExa {
 		d.Exa = &ai.Exa{APIKey: viper.GetString(config.KeyExaAPIKey)}
 	}
 	return d
 }
 
-// buildImage builds a persona image, streaming docker output dimmed.
-func buildImage(ctx context.Context, name string, noCache bool, out io.Writer) error {
+// exportError is a microVM disk export that failed after the image itself
+// built: the build is fine, the persona just can't be spawned as a microVM
+// until the export works.
+type exportError struct{ err error }
+
+func (e *exportError) Error() string {
+	return "exporting the image to a microVM disk failed: " + e.err.Error()
+}
+func (e *exportError) Unwrap() error { return e.err }
+
+// exportDisk exports a persona's image to its microVM disk, so spawns start
+// from it without waiting (runtimes without disks do nothing). Every build,
+// update and customize ends with it; a failure fails the command.
+func exportDisk(ctx context.Context, name, image string, out io.Writer) error {
+	p, ok := instance.Current().(instance.Preparer)
+	if !ok {
+		return nil
+	}
+	start := time.Now()
+	if err := p.Prepare(ctx, name, image); err != nil {
+		return &exportError{err}
+	}
+	ui.Success(out, fmt.Sprintf("Exported the microVM disk in %s", time.Since(start).Round(100*time.Millisecond)))
+	return nil
+}
+
+// buildImage builds a persona image, streaming build output dimmed, and
+// exports it to its microVM disk.
+func buildImage(ctx context.Context, name string, refresh bool, out io.Writer) error {
 	if err := docker.Available(ctx); err != nil {
 		return err
 	}
 	fmt.Fprintln(out, ui.Heading.Render("Building image "+persona.ImageFor(name)))
 	start := time.Now()
-	if err := docker.Build(ctx, name, noCache, &dimWriter{w: out}); err != nil {
+	if err := docker.Build(ctx, docker.BuildOptions{Name: name, Refresh: refresh, Out: &dimWriter{w: out}}); err != nil {
 		return err
 	}
 	ui.Success(out, fmt.Sprintf("Built %s in %s", persona.ImageFor(name), time.Since(start).Round(time.Second)))
-	if p, ok := instance.Current().(instance.Preparer); ok {
-		start = time.Now()
-		if err := p.Prepare(ctx, name, persona.ImageFor(name)); err != nil {
-			ui.Warning(out, "microVM disk not prepared ("+err.Error()+"); spawn will create it")
-		} else {
-			ui.Success(out, fmt.Sprintf("Prepared the microVM disk in %s", time.Since(start).Round(100*time.Millisecond)))
-		}
-	}
-	return nil
+	return exportDisk(ctx, name, persona.ImageFor(name), out)
 }
 
 // dimWriter renders streamed build output in a muted color, line by line.
@@ -228,4 +250,37 @@ func preinstalledPlugins() []string {
 		}
 	}
 	return ids
+}
+
+// reviewCustomInstalls shows install commands the designer wrote from a web
+// page (custom toolchains). With ask, it confirms before keeping them (they
+// run as root inside the image build); declined ones are dropped.
+func reviewCustomInstalls(p *persona.Persona, out io.Writer, ask bool) error {
+	custom := persona.CustomInstalls(p.Toolchains)
+	if len(custom) == 0 {
+		return nil
+	}
+	for _, t := range custom {
+		fmt.Fprintln(out, ui.Heading.Render("Install commands for "+t.Name)+ui.Dim.Render("  (from "+t.Source+", run as root at build time)"))
+		for _, line := range strings.Split(strings.TrimSpace(t.Install), "\n") {
+			fmt.Fprintln(out, ui.Dim.Render("  │ ")+line)
+		}
+	}
+	if !ask || !ui.Interactive() {
+		return nil
+	}
+	ok, err := confirm("Use these install commands?", true)
+	if err != nil || ok {
+		return err
+	}
+	var kept []persona.Toolchain
+	for _, t := range p.Toolchains {
+		if t.Install == "" {
+			kept = append(kept, t)
+			continue
+		}
+		ui.Warning(out, "dropped toolchain "+t.Name+"; add it later with `persona edit "+p.Name+" --spec` (for example with nix: <attribute>)")
+	}
+	p.Toolchains = kept
+	return nil
 }

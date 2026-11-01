@@ -94,7 +94,13 @@ func identify(id agent.Identity) error {
 		}
 	}
 	if len(id.Nameservers) > 0 {
-		writeResolv("nameserver " + strings.Join(id.Nameservers, "\nnameserver ") + "\n")
+		conf := "nameserver " + strings.Join(id.Nameservers, "\nnameserver ") + "\n"
+		if len(id.Search) > 0 {
+			conf += "search " + strings.Join(id.Search, " ") + "\n"
+		}
+		// Fail over quickly when the first (persona's DNS) doesn't answer.
+		conf += "options timeout:1 attempts:2\n"
+		writeResolv(conf)
 	}
 	return nil
 }

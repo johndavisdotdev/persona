@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -27,7 +28,7 @@ type propagateOpts struct {
 func (o *propagateOpts) register(cmd *cobra.Command) {
 	cmd.Flags().BoolVarP(&o.yes, "yes", "y", false, "apply without confirmation")
 	cmd.Flags().BoolVar(&o.build, "build", false, "rebuild affected images without prompting")
-	cmd.Flags().BoolVar(&o.noBuild, "no-build", false, "regenerate Dockerfiles but do not rebuild images")
+	cmd.Flags().BoolVar(&o.noBuild, "no-build", false, "regenerate image definitions but do not rebuild images")
 }
 
 func newBaseCmd() *cobra.Command {
@@ -46,12 +47,12 @@ name collisions). It lives in $PERSONA_HOME/base.yaml.
 With no arguments, shows the current base. With a plain-language requirement,
 Claude interprets it against the real marketplaces and updates the base. The
 --add-*/--remove-* flags make precise edits without AI. After a change, every
-persona's Dockerfile is regenerated (hand-edited ones are skipped with a
+persona's image definition is regenerated (hand-edited files are skipped with a
 warning) and the images are rebuilt.`,
 		Example: `  persona base
   persona base "All personas should have the Linear plugin from the default anthropic marketplace installed."
   persona base --add-plugin linear@claude-plugins-official
-  persona base --remove-plugin linear --add-apt jq
+  persona base --remove-plugin linear --add-package ffmpeg
   persona edit-base`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, out := cmd.Context(), cmd.OutOrStdout()
@@ -81,6 +82,12 @@ warning) and the images are rebuilt.`,
 				if err != nil {
 					return err
 				}
+				if np := nb.AsPersona(); len(persona.CustomInstalls(np.Toolchains)) > 0 {
+					if err := reviewCustomInstalls(np, out, false); err != nil {
+						return err
+					}
+					nb.Toolchains = np.Toolchains
+				}
 				next = *nb
 				if change != "" {
 					fmt.Fprintln(out, ui.Dim.Render("  → "+change))
@@ -88,6 +95,7 @@ warning) and the images are rebuilt.`,
 			}
 			if hasEdits {
 				p := next.AsPersona()
+				edits.base = true
 				if err := edits.apply(ctx, p, out); err != nil {
 					return err
 				}
@@ -184,10 +192,7 @@ func validateBaseFile(path string) error {
 		return fmt.Errorf("invalid base.yaml: %w", err)
 	}
 	probe := &persona.Persona{Name: "probe"}
-	if _, err := persona.RenderDockerfile(probe); err != nil {
-		return err
-	}
-	_, err = persona.RenderSettings(probe)
+	_, err = persona.Render(probe)
 	return err
 }
 
@@ -229,7 +234,7 @@ func showBase(out io.Writer, b *persona.Base) {
 	}
 }
 
-// propagateBase regenerates every persona's Dockerfile and optionally rebuilds.
+// propagateBase regenerates every persona's image definition and optionally rebuilds.
 func propagateBase(ctx context.Context, out io.Writer, o propagateOpts) error {
 	ps, errs := persona.List()
 	for _, e := range errs {
@@ -281,7 +286,11 @@ func propagateBase(ctx context.Context, out io.Writer, o propagateOpts) error {
 }
 
 func readGenerated(name string) string {
-	d, _ := os.ReadFile(persona.DockerfilePath(name))
-	st, _ := os.ReadFile(persona.SettingsPath(name))
-	return string(d) + "\x00" + string(st)
+	var b strings.Builder
+	for _, f := range persona.EditableFiles {
+		c, _ := os.ReadFile(filepath.Join(persona.Dir(name), f))
+		b.Write(c)
+		b.WriteByte(0)
+	}
+	return b.String()
 }

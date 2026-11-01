@@ -21,28 +21,30 @@ import (
 func newConfigureCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "configure",
-		Short: "Store the API keys the persona designer uses",
+		Short: "Store API keys: Anthropic and Exa for the designer, OpenRouter for spawns",
 		Long: `Prompts for an Anthropic API key (needed by ` + "`persona new`" + `, ` + "`update --redesign`" + ` and
-` + "`base`" + `) and an optional Exa API key (lets the designer search the web). Keys are
-stored in $PERSONA_HOME/credentials/api-keys.json, readable only by you.
+` + "`base`" + `), an optional Exa API key (lets the designer search the web), and an
+OpenRouter API key (passed to spawns as OPENROUTER_API_KEY, for harnesses such
+as pi that reach models through OpenRouter). Keys are stored in
+$PERSONA_HOME/credentials/api-keys.json, readable only by you.
 
 Leave a prompt blank to keep the current key, or enter - to remove it.
-ANTHROPIC_API_KEY and EXA_API_KEY in your environment take precedence over
-stored keys.
+ANTHROPIC_API_KEY, EXA_API_KEY and OPENROUTER_API_KEY in your environment take
+precedence over stored keys.
 
-Instances don't use these keys; they sign in with your Claude subscription
-(see ` + "`persona auth login`" + `).`,
+Claude Code in spawns signs in with your Claude subscription instead (see
+` + "`persona auth login`" + `).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, out := cmd.Context(), cmd.OutOrStdout()
 			if !ui.Interactive() {
-				return errors.New("configure needs a terminal; in scripts, set ANTHROPIC_API_KEY and EXA_API_KEY instead")
+				return errors.New("configure needs a terminal; in scripts, set ANTHROPIC_API_KEY, EXA_API_KEY and OPENROUTER_API_KEY instead")
 			}
 			keys, err := config.LoadAPIKeys()
 			if err != nil {
 				return err
 			}
-			var anthropic, exa string
+			var anthropic, exa, openrouter string
 			form := huh.NewForm(huh.NewGroup(
 				huh.NewInput().Title("Anthropic API key").
 					Description(keyStatus(keys.Anthropic, "ANTHROPIC_API_KEY", "required by the persona designer")).
@@ -50,6 +52,9 @@ Instances don't use these keys; they sign in with your Claude subscription
 				huh.NewInput().Title("Exa API key").
 					Description(keyStatus(keys.Exa, "EXA_API_KEY", "optional: lets the designer search the web")).
 					EchoMode(huh.EchoModePassword).Value(&exa),
+				huh.NewInput().Title("OpenRouter API key").
+					Description(keyStatus(keys.OpenRouter, "OPENROUTER_API_KEY", "used by spawns whose harness reaches models through OpenRouter (pi)")).
+					EchoMode(huh.EchoModePassword).Value(&openrouter),
 			))
 			if err := form.Run(); err != nil {
 				if errors.Is(err, huh.ErrUserAborted) {
@@ -83,6 +88,9 @@ Instances don't use these keys; they sign in with your Claude subscription
 			if err := apply(exa, &keys.Exa, "Exa API key"); err != nil {
 				return err
 			}
+			if err := apply(openrouter, &keys.OpenRouter, "OpenRouter API key"); err != nil {
+				return err
+			}
 			if v := strings.TrimSpace(anthropic); v != "" && v != "-" {
 				if err := checkAnthropicKey(ctx, v); err != nil {
 					var bad *badKeyError
@@ -94,6 +102,17 @@ Instances don't use these keys; they sign in with your Claude subscription
 					ui.Step(out, "Anthropic API key verified")
 				}
 			}
+			if v := strings.TrimSpace(openrouter); v != "" && v != "-" {
+				if err := checkBearerKey(ctx, "https://openrouter.ai/api/v1/key", v); err != nil {
+					var bad *badKeyError
+					if errors.As(err, &bad) {
+						return fmt.Errorf("OpenRouter rejected the key (%s); nothing was saved", bad.status)
+					}
+					ui.Warning(out, "couldn't verify the OpenRouter key ("+err.Error()+"); saving it anyway")
+				} else {
+					ui.Step(out, "OpenRouter API key verified")
+				}
+			}
 			if changed {
 				if err := config.SaveAPIKeys(keys); err != nil {
 					return err
@@ -102,7 +121,7 @@ Instances don't use these keys; they sign in with your Claude subscription
 			} else {
 				fmt.Fprintln(out, ui.Dim.Render("No changes."))
 			}
-			for _, env := range []string{"ANTHROPIC_API_KEY", "EXA_API_KEY"} {
+			for _, env := range []string{"ANTHROPIC_API_KEY", "EXA_API_KEY", "OPENROUTER_API_KEY"} {
 				if _, ok := os.LookupEnv(env); ok {
 					fmt.Fprintln(out, ui.Dim.Render(env+" is set in your environment and takes precedence over the stored key."))
 				}
@@ -151,6 +170,29 @@ func checkAnthropicKey(ctx context.Context, key string) error {
 	}
 	req.Header.Set("x-api-key", key)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return &badKeyError{status: resp.Status}
+	case resp.StatusCode/100 != 2:
+		return errors.New(resp.Status)
+	}
+	return nil
+}
+
+// checkBearerKey makes one authenticated GET with a bearer token.
+func checkBearerKey(ctx context.Context, url, key string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err

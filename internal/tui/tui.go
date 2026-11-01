@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -24,8 +25,9 @@ import (
 	"github.com/johndavisdev/persona/internal/ui"
 )
 
-// SpawnFunc starts a container for a persona sized cols x rows and returns its name.
-type SpawnFunc func(ctx context.Context, persona string, cols, rows int) (string, error)
+// SpawnFunc starts a container for a persona in a network namespace, sized
+// cols x rows, and returns its name.
+type SpawnFunc func(ctx context.Context, persona, namespace string, cols, rows int) (string, error)
 
 const (
 	sidebarOpenWidth = 30
@@ -47,7 +49,9 @@ type tab struct {
 }
 
 type sideItem struct {
-	persona   string
+	namespace string
+	header    bool   // a namespace heading (only when grouping)
+	persona   string // empty for a heading
 	container string // empty for a persona row
 	state     string
 	summary   string
@@ -63,9 +67,13 @@ type model struct {
 
 	personas   []*persona.Persona
 	containers []instance.Container
+	namespaces []string
 	items      []sideItem
 	cursor     int
 	seeded     bool
+	// filter shows only one namespace; without it, the sidebar groups
+	// spawns by namespace.
+	filter string
 
 	tabs   []*tab
 	active int
@@ -90,11 +98,13 @@ type model struct {
 // rt is the runtime instances run on, fixed for the life of the TUI.
 var rt instance.Runtime = instance.Docker{}
 
-func Run(ctx context.Context, spawn SpawnFunc) error {
+// With namespace, it shows (and spawns into) only that namespace.
+func Run(ctx context.Context, spawn SpawnFunc, namespace string) error {
 	rt = instance.Current()
 	m := &model{
 		ctx:         ctx,
 		spawn:       spawn,
+		filter:      namespace,
 		sidebarOpen: true,
 		sidebarX:    sidebarOpenWidth,
 		spring:      harmonica.NewSpring(harmonica.FPS(60), 7.0, 0.85),
@@ -124,6 +134,7 @@ type frameMsg struct{}
 type dataMsg struct {
 	personas   []*persona.Persona
 	containers []instance.Container
+	namespaces []string
 	err        error
 }
 
@@ -158,7 +169,11 @@ func (m *model) load() tea.Cmd {
 	return func() tea.Msg {
 		ps, _ := persona.List()
 		cs, err := rt.List(ctx, "")
-		return dataMsg{personas: ps, containers: cs, err: err}
+		ns, nerr := instance.Namespaces(ctx, rt)
+		if nerr != nil {
+			ns = []string{instance.DefaultNamespace}
+		}
+		return dataMsg{personas: ps, containers: cs, namespaces: ns, err: err}
 	}
 }
 
@@ -196,31 +211,78 @@ func (m *model) setStatus(err bool, format string, a ...any) {
 
 func (m *model) sidebarWidth() int { return int(math.Round(math.Max(0, m.sidebarX))) }
 
+// rebuildItems lays out the sidebar: running spawns only, under their
+// persona, under a heading per namespace (or, filtered, just the one
+// namespace without a heading). Namespaces and personas without running
+// spawns are left out.
 func (m *model) rebuildItems() {
-	var items []sideItem
-	byPersona := map[string][]instance.Container{}
+	byNS := map[string]map[string][]instance.Container{}
 	for _, c := range m.containers {
-		byPersona[c.Persona] = append(byPersona[c.Persona], c)
-	}
-	known := map[string]bool{}
-	for _, p := range m.personas {
-		known[p.Name] = true
-		items = append(items, sideItem{persona: p.Name, summary: p.Summary})
-		for _, c := range byPersona[p.Name] {
-			items = append(items, sideItem{persona: p.Name, container: c.Name, state: c.State})
-		}
-	}
-	for name, cs := range byPersona {
-		if known[name] {
+		if !c.Running() {
 			continue
 		}
-		for _, c := range cs {
-			items = append(items, sideItem{persona: name, container: c.Name, state: c.State})
+		ns := instance.NamespaceOf(c)
+		if m.filter != "" && ns != m.filter {
+			continue
+		}
+		if byNS[ns] == nil {
+			byNS[ns] = map[string][]instance.Container{}
+		}
+		byNS[ns][c.Persona] = append(byNS[ns][c.Persona], c)
+	}
+	// Namespaces in the runtime's order, then any since removed.
+	var namespaces []string
+	for _, ns := range m.namespaces {
+		if byNS[ns] != nil {
+			namespaces = append(namespaces, ns)
+		}
+	}
+	var rest []string
+	for ns := range byNS {
+		if !slices.Contains(namespaces, ns) {
+			rest = append(rest, ns)
+		}
+	}
+	slices.Sort(rest)
+	namespaces = append(namespaces, rest...)
+
+	summaries := map[string]string{}
+	for _, p := range m.personas {
+		summaries[p.Name] = p.Summary
+	}
+	var items []sideItem
+	for _, ns := range namespaces {
+		if m.filter == "" {
+			items = append(items, sideItem{namespace: ns, header: true})
+		}
+		var names []string
+		for name := range byNS[ns] {
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		for _, name := range names {
+			items = append(items, sideItem{namespace: ns, persona: name, summary: summaries[name]})
+			for _, c := range byNS[ns][name] {
+				items = append(items, sideItem{namespace: ns, persona: name, container: c.Name, state: c.State})
+			}
 		}
 	}
 	m.items = items
 	if m.cursor >= len(items) {
 		m.cursor = max(0, len(items)-1)
+	}
+	if m.cursor < len(items) && items[m.cursor].header {
+		m.moveCursor(1)
+	}
+}
+
+// moveCursor moves the selection by delta rows, skipping namespace headings.
+func (m *model) moveCursor(delta int) {
+	for i := m.cursor + delta; i >= 0 && i < len(m.items); i += delta {
+		if !m.items[i].header {
+			m.cursor = i
+			return
+		}
 	}
 }
 
@@ -252,7 +314,7 @@ func (m *model) openContainer(container, personaName string) {
 	target.attach(m.ctx, container, personaName)
 }
 
-func (m *model) spawnInto(personaName string, forceNew bool) tea.Cmd {
+func (m *model) spawnInto(personaName, namespace string, forceNew bool) tea.Cmd {
 	t := m.tab()
 	target := m.focused()
 	if forceNew || target == nil || target.container != "" || target.starting {
@@ -265,10 +327,14 @@ func (m *model) spawnInto(personaName string, forceNew bool) tea.Cmd {
 	r := m.rects[target.id]
 	cols, rows := max(20, r.w-2), max(5, r.h-2)
 	m.busy++
-	m.setStatus(false, "Spawning %s (building the image first if needed)…", personaName)
+	where := ""
+	if namespace != "" && namespace != instance.DefaultNamespace {
+		where = " in namespace " + namespace
+	}
+	m.setStatus(false, "Spawning %s%s (building the image first if needed)…", personaName, where)
 	id, ctx, spawn := target.id, m.ctx, m.spawn
 	return tea.Batch(m.spin.Tick, func() tea.Msg {
-		name, err := spawn(ctx, personaName, cols, rows)
+		name, err := spawn(ctx, personaName, namespace, cols, rows)
 		return spawnedMsg{pane: id, persona: personaName, container: name, err: err}
 	})
 }
@@ -361,12 +427,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.setStatus(true, "docker: %v", msg.err)
 		}
-		m.personas, m.containers = msg.personas, msg.containers
+		m.personas, m.containers, m.namespaces = msg.personas, msg.containers, msg.namespaces
 		m.rebuildItems()
 		if !m.seeded {
 			m.seeded = true
 			n := 0
 			for _, c := range m.containers {
+				if m.filter != "" && instance.NamespaceOf(c) != m.filter {
+					continue
+				}
 				if c.Running() && n < 4 {
 					m.openContainer(c.Name, c.Persona)
 					n++
@@ -398,9 +467,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case stoppedMsg:
 		m.busy--
 		if msg.err != nil {
-			m.setStatus(true, "stop %s: %v", msg.container, msg.err)
+			m.setStatus(true, "kill %s: %v", msg.container, msg.err)
 		} else {
-			m.setStatus(false, "Stopped %s", msg.container)
+			m.setStatus(false, "Killed %s", msg.container)
 		}
 		return m, m.load()
 
@@ -438,7 +507,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if mouse.X < m.sidebarWidth() && mouse.Y >= 3 {
-			if idx := mouse.Y - 3; idx < len(m.items) {
+			if idx := mouse.Y - 3; idx < len(m.items) && !m.items[idx].header {
 				m.cursor = idx
 			}
 		}
@@ -481,14 +550,17 @@ func (m *model) handleNormal(msg tea.KeyPressMsg) tea.Cmd {
 	case key.Matches(msg, keys.Help):
 		m.showHelp = true
 	case key.Matches(msg, keys.Up):
-		m.cursor = max(0, m.cursor-1)
+		m.moveCursor(-1)
 	case key.Matches(msg, keys.Down):
-		m.cursor = min(len(m.items)-1, m.cursor+1)
+		m.moveCursor(1)
 	case key.Matches(msg, keys.Select):
 		if m.cursor < len(m.items) {
 			it := m.items[m.cursor]
+			if it.header {
+				return nil
+			}
 			if it.container == "" {
-				return m.spawnInto(it.persona, false)
+				return m.spawnInto(it.persona, it.namespace, false)
 			}
 			if it.state != "running" {
 				m.setStatus(true, "%s is %s", it.container, it.state)
@@ -497,8 +569,9 @@ func (m *model) handleNormal(msg tea.KeyPressMsg) tea.Cmd {
 			m.openContainer(it.container, it.persona)
 		}
 	case key.Matches(msg, keys.Spawn):
-		if m.cursor < len(m.items) {
-			return m.spawnInto(m.items[m.cursor].persona, true)
+		if m.cursor < len(m.items) && !m.items[m.cursor].header {
+			it := m.items[m.cursor]
+			return m.spawnInto(it.persona, it.namespace, true)
 		}
 	case key.Matches(msg, keys.NewPane):
 		t.panes = append(t.panes, m.newPane())
@@ -513,13 +586,11 @@ func (m *model) handleNormal(msg tea.KeyPressMsg) tea.Cmd {
 		name, ctx := p.container, m.ctx
 		m.closePane()
 		m.busy++
-		m.setStatus(false, "Stopping %s…", name)
+		m.setStatus(false, "Killing %s…", name)
 		return tea.Batch(m.spin.Tick, func() tea.Msg {
-			err := rt.Stop(ctx, name)
-			if err == nil {
-				if err = rt.Remove(ctx, name); instance.IsKept(err) {
-					err = nil // the worktree was kept on purpose
-				}
+			err := rt.Remove(ctx, name)
+			if instance.IsKept(err) {
+				err = nil // the worktree was kept on purpose
 			}
 			return stoppedMsg{container: name, err: err}
 		})
@@ -747,23 +818,34 @@ func (m *model) renderSidebar(w, h int) []string {
 			out[i] = " " + fit(s, inner) + " "
 		}
 	}
-	add(0, ui.Heading.Render("PERSONAS"))
+	title := "PERSONAS"
+	if m.filter != "" {
+		title += " · " + m.filter
+	}
+	add(0, ui.Heading.Render(title))
 	add(1, ui.Dim.Render(strings.Repeat("─", inner)))
 	const first = 2 // body row of the first item (screen row 3)
 	if len(m.items) == 0 {
-		add(first, ui.Dim.Render("none — run `persona new`"))
+		add(first, ui.Dim.Render("no running spawns — `persona spawn`"))
+	}
+	indent := ""
+	if m.filter == "" {
+		indent = "  " // under a namespace heading
 	}
 	for i, it := range m.items {
 		var s string
-		if it.container == "" {
-			s = ui.Bold.Render("◆ " + it.persona)
-		} else {
+		switch {
+		case it.header:
+			s = ui.Dim.Render("▾ ") + ui.Heading.Render(it.namespace)
+		case it.container == "":
+			s = indent + ui.Bold.Render("◆ "+it.persona)
+		default:
 			dot := ui.OK.Render("●")
 			if it.state != "running" {
 				dot = ui.Dim.Render("○")
 			}
 			short := strings.TrimPrefix(it.container, "persona-"+it.persona+"-")
-			s = "  " + dot + " " + short
+			s = indent + "  " + dot + " " + short
 		}
 		s = fit(s, inner)
 		if i == m.cursor && m.mode == modeNormal {

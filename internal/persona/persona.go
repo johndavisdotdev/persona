@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -18,10 +19,7 @@ import (
 	"github.com/johndavisdev/persona/internal/config"
 )
 
-const (
-	specFile       = "persona.yaml"
-	dockerfileName = "Dockerfile"
-)
+const specFile = "persona.yaml"
 
 // ErrNotFound is returned when a persona does not exist.
 var ErrNotFound = errors.New("persona not found")
@@ -75,35 +73,91 @@ type Skill struct {
 
 // Persona is the full definition of a persona.
 type Persona struct {
-	Name         string        `yaml:"name"`
-	Description  string        `yaml:"description"`
-	Summary      string        `yaml:"summary,omitempty"`
-	Instructions string        `yaml:"instructions,omitempty"` // becomes ~/.claude/CLAUDE.md
-	Model        string        `yaml:"model,omitempty"`        // Claude Code model inside the container
-	BaseImage    string        `yaml:"base_image,omitempty"`
-	Marketplaces []Marketplace `yaml:"marketplaces,omitempty"`
-	Plugins      []Plugin      `yaml:"plugins,omitempty"`
-	MCPServers   []MCPServer   `yaml:"mcp_servers,omitempty"`
-	Skills       []Skill       `yaml:"skills,omitempty"`
-	AptPackages  []string      `yaml:"apt_packages,omitempty"`
-	Env          []string      `yaml:"env,omitempty"` // host env var names forwarded on spawn
+	Name         string `yaml:"name"`
+	Description  string `yaml:"description"`
+	Summary      string `yaml:"summary,omitempty"`
+	Instructions string `yaml:"instructions,omitempty"` // becomes ~/.claude/CLAUDE.md
+	Model        string `yaml:"model,omitempty"`        // harness model: Claude Code alias, or provider/model for pi
+	// Harness is the coding agent spawns run: pi or claude (default: the
+	// base's, else DefaultHarness).
+	Harness string `yaml:"harness,omitempty"`
+	// HarnessPackages are pi packages beyond the base's ("npm:<name>"); a
+	// leading "-" removes one of the base's.
+	HarnessPackages []string      `yaml:"harness_packages,omitempty"`
+	BaseImage       string        `yaml:"base_image,omitempty"`
+	Marketplaces    []Marketplace `yaml:"marketplaces,omitempty"`
+	Plugins         []Plugin      `yaml:"plugins,omitempty"`
+	MCPServers      []MCPServer   `yaml:"mcp_servers,omitempty"`
+	Skills          []Skill       `yaml:"skills,omitempty"`
+	// Packages are nixpkgs attributes in the image ("jq", "python3Packages.ruff").
+	Packages []string `yaml:"packages,omitempty"`
+	// AptPackages are Debian package names from older specs; they're mapped to
+	// nixpkgs (see AptToNix).
+	AptPackages []string `yaml:"apt_packages,omitempty"`
+	// Toolchains are language SDKs/runtimes installed from their primary sources.
+	Toolchains []Toolchain `yaml:"toolchains,omitempty"`
+	// Tools are developer tools (linters, formatters, language servers)
+	// installed with a toolchain's package manager or apt.
+	Tools []Tool   `yaml:"tools,omitempty"`
+	Env   []string `yaml:"env,omitempty"` // host env var names forwarded on spawn
 	// Settings are persona-specific overrides deep-merged last into settings.json
 	// (after base-settings.json and the base). A null value removes a key.
 	Settings  map[string]any `yaml:"settings,omitempty"`
 	CreatedAt time.Time      `yaml:"created_at"`
 	UpdatedAt time.Time      `yaml:"updated_at"`
-	// DockerfileHash is the hash of the last generated Dockerfile. A mismatch
-	// means the Dockerfile was hand-edited and must not be silently regenerated.
+	// Hashes of the generated files (flake.nix, setup scripts, settings.json)
+	// as last written. A mismatch means the file was hand-edited and must not
+	// be silently regenerated.
+	FileHashes map[string]string `yaml:"file_hashes,omitempty"`
+	// DockerfileHash is from Dockerfile-built personas (before Nix); unused.
 	DockerfileHash string `yaml:"dockerfile_hash,omitempty"`
-	// SettingsHash is the same protection for the generated settings.json.
+	// SettingsHash is from before FileHashes; unused.
 	SettingsHash string `yaml:"settings_hash,omitempty"`
+	// SavedFrom is set for personas captured from a spawn with `persona save`.
+	// Their image is that capture, with no definition behind it, so they can
+	// only change through another spawn and save.
+	SavedFrom *SavedFrom `yaml:"saved_from,omitempty"`
+	// Customized is set once the image was changed by hand with `persona
+	// customize`. Rebuilding from the flake would lose those changes, so the
+	// persona is frozen like a saved one.
+	Customized *Customized `yaml:"customized,omitempty"`
+}
+
+// Customized records hand changes made with `persona customize`.
+type Customized struct {
+	At      time.Time `yaml:"at"`
+	Summary string    `yaml:"summary,omitempty"` // what changed (docker diff, abbreviated)
+}
+
+// SavedFrom records where a saved persona came from.
+type SavedFrom struct {
+	Persona string    `yaml:"persona"`
+	Spawn   string    `yaml:"spawn"`
+	At      time.Time `yaml:"at"`
+}
+
+// Saved reports whether p was captured from a spawn (see SavedFrom).
+func (p *Persona) Saved() bool { return p.SavedFrom != nil }
+
+// Frozen reports whether p's image can no longer be rebuilt from its
+// definition: it was saved from a spawn or customized by hand.
+func (p *Persona) Frozen() bool { return p.SavedFrom != nil || p.Customized != nil }
+
+// ErrFrozen explains why a frozen persona can't be edited or rebuilt.
+func ErrFrozen(p *Persona) error {
+	if p.SavedFrom != nil {
+		return fmt.Errorf("%s was saved from spawn %s and has no definition to rebuild from; change it with `persona customize %s`, or by spawning it, making the changes there, and running `persona save <spawn> <name>`",
+			p.Name, p.SavedFrom.Spawn, p.Name)
+	}
+	return fmt.Errorf("%s was customized by hand (%s) and rebuilding it from its flake would lose that; change it with `persona customize %s`",
+		p.Name, p.Customized.At.Local().Format("2006-01-02 15:04"), p.Name)
 }
 
 // Dir is the persona's directory.
 func Dir(name string) string { return filepath.Join(config.PersonasDir(), name) }
 
-// DockerfilePath is the persona's Dockerfile path.
-func DockerfilePath(name string) string { return filepath.Join(Dir(name), dockerfileName) }
+// FlakePath is the persona's flake.nix.
+func FlakePath(name string) string { return filepath.Join(Dir(name), FileFlake) }
 
 // SpecPath is the persona's spec path.
 func SpecPath(name string) string { return filepath.Join(Dir(name), specFile) }
@@ -158,6 +212,10 @@ func List() ([]*Persona, []error) {
 		if !e.IsDir() || ValidateName(e.Name()) != nil {
 			continue
 		}
+		// Not a persona (yet): e.g. a build left only its output behind.
+		if _, err := os.Stat(filepath.Join(config.PersonasDir(), e.Name(), "persona.yaml")); errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		p, err := Load(e.Name())
 		if err != nil {
 			errs = append(errs, err)
@@ -189,65 +247,108 @@ func (p *Persona) Save() error {
 	return writeAtomic(SpecPath(p.Name), b)
 }
 
-// Generated files that make up a persona's image.
+// Generated files that make up a persona's image definition. Each is
+// hash-protected: a hand-edited one isn't overwritten without force.
 const (
-	FileDockerfile = "Dockerfile"
+	FileFlake      = "flake.nix"
+	FileSetupRoot  = "setup-root.sh"
+	FileSetupUser  = "setup-user.sh"
 	FileSettings   = "settings.json"
+	DirFiles       = "files" // supporting files the setup scripts install; always regenerated
+	fileDockerfile = "Dockerfile"
 )
 
-// Generate renders and writes the persona's Dockerfile and settings.json,
-// recording their hashes. Without force, a hand-edited file is left alone and
-// its name returned in skipped. The spec is saved either way.
+// EditableFiles are the generated files, in the order `persona edit` offers them.
+var EditableFiles = []string{FileFlake, FileSetupRoot, FileSetupUser, FileSettings}
+
+// Generate renders and writes the persona's image definition (flake.nix, the
+// setup scripts, settings.json and files/), recording their hashes. Without
+// force, a hand-edited file is left alone and its name returned in skipped.
+// The spec is saved either way.
 func (p *Persona) Generate(force bool) (skipped []string, err error) {
-	dockerfile, err := RenderDockerfile(p)
+	if p.Frozen() {
+		return nil, p.Save() // its image is the definition
+	}
+	def, err := Render(p)
 	if err != nil {
 		return nil, err
 	}
-	settings, err := RenderSettings(p)
-	if err != nil {
+	dir := Dir(p.Name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(Dir(p.Name), 0o755); err != nil {
-		return nil, err
+	if p.FileHashes == nil {
+		p.FileHashes = map[string]string{}
 	}
-	for _, f := range []struct {
-		name, path, content string
-		hash                *string
-	}{
-		{FileDockerfile, DockerfilePath(p.Name), dockerfile, &p.DockerfileHash},
-		{FileSettings, SettingsPath(p.Name), settings, &p.SettingsHash},
-	} {
+	for _, name := range EditableFiles {
+		content := def.Files[name]
+		path := filepath.Join(dir, name)
 		if !force {
-			edited, err := fileEdited(f.path, *f.hash)
+			edited, err := fileEdited(path, p.FileHashes[name])
 			if err != nil {
 				return nil, err
 			}
 			if edited {
-				skipped = append(skipped, f.name)
+				skipped = append(skipped, name)
 				continue
 			}
 		}
-		if err := writeAtomic(f.path, []byte(f.content)); err != nil {
+		if err := writeAtomic(path, []byte(content)); err != nil {
 			return nil, err
 		}
-		*f.hash = hash([]byte(f.content))
+		if strings.HasSuffix(name, ".sh") {
+			if err := os.Chmod(path, 0o755); err != nil {
+				return nil, err
+			}
+		}
+		p.FileHashes[name] = hash([]byte(content))
 	}
+	if err := writeFilesDir(filepath.Join(dir, DirFiles), def.Support); err != nil {
+		return nil, err
+	}
+	// Dockerfile-era leftovers.
+	os.Remove(filepath.Join(dir, fileDockerfile))
+	p.DockerfileHash, p.SettingsHash = "", ""
 	return skipped, p.Save()
+}
+
+// writeFilesDir replaces dir with files (relative path → content; a path
+// ending in ".sh" or under bin/ is executable).
+func writeFilesDir(dir string, files map[string]string) error {
+	tmp := dir + ".tmp"
+	os.RemoveAll(tmp)
+	for rel, content := range files {
+		path := filepath.Join(tmp, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		mode := os.FileMode(0o644)
+		if strings.HasSuffix(rel, ".sh") || strings.HasPrefix(rel, "bin/") {
+			mode = 0o755
+		}
+		if err := os.WriteFile(path, []byte(content), mode); err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dir)
 }
 
 // EditedFiles lists generated files that were hand-edited since generation.
 func (p *Persona) EditedFiles() ([]string, error) {
 	var out []string
-	for _, f := range []struct{ name, path, hash string }{
-		{FileDockerfile, DockerfilePath(p.Name), p.DockerfileHash},
-		{FileSettings, SettingsPath(p.Name), p.SettingsHash},
-	} {
-		edited, err := fileEdited(f.path, f.hash)
+	for _, name := range EditableFiles {
+		edited, err := fileEdited(filepath.Join(Dir(p.Name), name), p.FileHashes[name])
 		if err != nil {
 			return nil, err
 		}
 		if edited {
-			out = append(out, f.name)
+			out = append(out, name)
 		}
 	}
 	return out, nil
@@ -331,6 +432,18 @@ func (p *Persona) Normalize() {
 	}
 	p.Skills = sks
 	p.AptPackages = dedupe(p.AptPackages)
+	p.Packages = slices.DeleteFunc(dedupe(p.Packages), func(s string) bool { return ValidateNixPackage(s) != nil })
+	p.HarnessPackages = dedupe(p.HarnessPackages)
+	p.Tools = normalizeTools(p.Tools)
+	for _, tc := range toolToolchains(p.Tools) {
+		if !slices.ContainsFunc(p.Toolchains, func(t Toolchain) bool { return t.Name == tc }) {
+			p.Toolchains = append(p.Toolchains, Toolchain{Name: tc, Reason: "needed by its developer tools"})
+		}
+	}
+	if p.Harness == HarnessPi && !slices.ContainsFunc(p.Toolchains, func(t Toolchain) bool { return t.Name == "node" }) {
+		p.Toolchains = append(p.Toolchains, Toolchain{Name: "node", Reason: "needed by the pi harness"})
+	}
+	p.Toolchains = normalizeToolchains(p.Toolchains)
 	p.Env = dedupe(p.Env)
 }
 

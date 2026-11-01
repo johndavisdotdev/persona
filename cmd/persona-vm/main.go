@@ -9,6 +9,12 @@
 //	persona-vm stop ID
 //	persona-vm list
 //	persona-vm collect ID --to DIR NAME...                copy files out of the jail (e.g. a snapshot)
+//	persona-vm start --id ID [--ns NAME] [--file ...]...     in network namespace NAME (default: default)
+//	persona-vm mcast-socket [--ns NAME] <&unix-socket      a UDP socket on a namespace's bridge, passed back on stdin
+//	persona-vm ns-create NAME | ns-remove NAME | ns-list   persona network namespaces (see persona-netns)
+//	persona-vm fw-add --id ID --proto tcp|udp --host-ip IP --host-port N --port N
+//	persona-vm fw-rm RULE | fw-rm --vm ID | fw-list       port forwards from the host to a VM (see fw.go)
+//	persona-vm dns                                         the DNS server for every namespace (persona-dns.service; see dns.go)
 //
 // Every path the caller passes must be a regular file or directory owned by
 // the invoking user (SUDO_UID), or, for read-only files, root-owned and
@@ -22,6 +28,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -36,15 +43,14 @@ import (
 )
 
 const (
-	chrootBase = "/srv/jailer"
-	fcBin      = "/usr/libexec/persona/firecracker"
-	jailerBin  = "/usr/libexec/persona/jailer"
-	ipBin      = "/usr/sbin/ip"
-	netnsName  = "persona"
-	netnsPath  = "/run/netns/persona"
-	bridge     = "fcbr0"
-	uidBase    = 1_500_000
-	uidCount   = 65_536
+	chrootBase  = "/srv/jailer"
+	fcBin       = "/usr/libexec/persona/firecracker"
+	jailerBin   = "/usr/libexec/persona/jailer"
+	ipBin       = "/usr/sbin/ip"
+	netnsScript = "/usr/libexec/persona/persona-netns"
+	bridge      = "fcbr0"
+	uidBase     = 1_500_000
+	uidCount    = 65_536
 )
 
 var (
@@ -63,16 +69,26 @@ type state struct {
 	JailUID int    `json:"jail_uid"`
 	Tap     string `json:"tap"`
 	Pid     int    `json:"pid"` // supervisor
+	// Namespace is the persona namespace the VM's tap is in ("" is default,
+	// for VMs started before namespaces). persona-netns reads it.
+	Namespace string `json:"namespace,omitempty"`
+	// IP is the guest's address (start --ip), which port forwards go to.
+	IP string `json:"ip,omitempty"`
+	// Spawn and Persona (start --name, --persona) are what persona-dns
+	// resolves to IP, for VMs in the same namespace.
+	Spawn   string `json:"spawn,omitempty"`
+	Persona string `json:"persona,omitempty"`
 }
 
 // Info is what start and list print for the caller.
 type Info struct {
-	ID      string `json:"id"`
-	Tap     string `json:"tap"`
-	API     string `json:"api_sock"`
-	Vsock   string `json:"vsock_sock"`
-	Console string `json:"console"`
-	Root    string `json:"root"`
+	ID        string `json:"id"`
+	Tap       string `json:"tap"`
+	API       string `json:"api_sock"`
+	Vsock     string `json:"vsock_sock"`
+	Console   string `json:"console"`
+	Root      string `json:"root"`
+	Namespace string `json:"namespace"`
 }
 
 func main() {
@@ -93,6 +109,22 @@ func main() {
 		err = cmdList()
 	case "collect":
 		err = cmdCollect(os.Args[2:])
+	case "dns":
+		err = cmdDNS(os.Args[2:])
+	case "fw-add":
+		err = cmdFWAdd(os.Args[2:])
+	case "fw-rm":
+		err = cmdFWRemove(os.Args[2:])
+	case "fw-list":
+		err = cmdFWList(os.Args[2:])
+	case "ns-create":
+		err = cmdNSCreate(os.Args[2:])
+	case "ns-remove":
+		err = cmdNSRemove(os.Args[2:])
+	case "ns-list":
+		err = cmdNSList(os.Args[2:])
+	case "mcast-socket":
+		err = cmdMcastSocket(os.Args[2:])
 	case "supervise": // internal: the detached per-VM supervisor
 		err = cmdSupervise(os.Args[2:])
 	default:
@@ -104,7 +136,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: persona-vm start --id ID [--file ro|rw:SRC:NAME]... | stop ID | list | collect ID --to DIR NAME...")
+	fmt.Fprintln(os.Stderr, "usage: persona-vm start --id ID [--file ro|rw:SRC:NAME]... | stop ID | list | collect ID --to DIR NAME... | mcast-socket [--ns NAME] | ns-create NAME | ns-remove NAME | ns-list | fw-add ... | fw-rm ID|--vm ID | fw-list | dns")
 	os.Exit(2)
 }
 
@@ -136,7 +168,7 @@ func statePath(id string) string { return filepath.Join(stateDir, id+".json") }
 func info(s state) Info {
 	d := userDir(s)
 	return Info{ID: s.ID, Tap: s.Tap, API: filepath.Join(d, "api.sock"), Vsock: filepath.Join(d, "vsock.sock"),
-		Console: filepath.Join(d, "console.log"), Root: rootDir(s.ID)}
+		Console: filepath.Join(d, "console.log"), Root: rootDir(s.ID), Namespace: namespaceOrDefault(s.Namespace)}
 }
 
 type fileArg struct{ mode, src, name string }
@@ -171,6 +203,10 @@ func cmdStart(args []string) error {
 	}
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	id := fs.String("id", "", "VM id")
+	nsName := fs.String("ns", defaultNamespace, "persona network namespace")
+	guestIP := fs.String("ip", "", "the guest's address on the bridge (for port forwards and DNS)")
+	spawnName := fs.String("name", "", "the spawn's name (resolved by persona-dns)")
+	personaName := fs.String("persona", "", "the spawn's persona")
 	var files multiFlag
 	fs.Var(&files, "file", "ro|rw:SRC:NAME (repeatable)")
 	if err := fs.Parse(args); err != nil {
@@ -178,6 +214,17 @@ func cmdStart(args []string) error {
 	}
 	if !idRE.MatchString(*id) {
 		return fmt.Errorf("invalid --id %q", *id)
+	}
+	if err := namespaceUp(*nsName); err != nil {
+		return err
+	}
+	if *guestIP != "" && !vmSubnet.Contains(net.ParseIP(*guestIP)) {
+		return fmt.Errorf("invalid --ip %q (must be in %s)", *guestIP, vmSubnet)
+	}
+	for _, n := range []string{*spawnName, *personaName} {
+		if n != "" && !dnsLabelRE.MatchString(n) {
+			return fmt.Errorf("invalid name %q", n)
+		}
 	}
 	var fargs []fileArg
 	for _, v := range files {
@@ -210,7 +257,8 @@ func cmdStart(args []string) error {
 	if err != nil {
 		return err
 	}
-	s := state{ID: *id, Owner: owner, OwnerG: ownerG, JailUID: allocUID(*id, used), Tap: TapName(*id)}
+	s := state{ID: *id, Owner: owner, OwnerG: ownerG, JailUID: allocUID(*id, used), Tap: TapName(*id), Namespace: *nsName, IP: *guestIP,
+		Spawn: *spawnName, Persona: *personaName}
 	if err := os.RemoveAll(jailDir(s.ID)); err != nil {
 		return err
 	}
@@ -252,11 +300,11 @@ func cmdStart(args []string) error {
 	}
 	con.Close()
 
-	if err := run(ipBin, "-n", netnsName, "tuntap", "add", "dev", s.Tap, "mode", "tap",
+	if err := run(ipBin, "-n", netnsOf(s.Namespace), "tuntap", "add", "dev", s.Tap, "mode", "tap",
 		"user", strconv.Itoa(s.JailUID), "group", strconv.Itoa(s.JailUID)); err != nil {
 		return err
 	}
-	if err := run(ipBin, "-n", netnsName, "link", "set", s.Tap, "master", bridge, "up"); err != nil {
+	if err := run(ipBin, "-n", netnsOf(s.Namespace), "link", "set", s.Tap, "master", bridge, "up"); err != nil {
 		return err
 	}
 
@@ -361,7 +409,7 @@ func cmdSupervise(args []string) error {
 
 	uid := strconv.Itoa(s.JailUID)
 	cmd := exec.Command(jailerBin, "--id", s.ID, "--exec-file", fcBin, "--uid", uid, "--gid", uid,
-		"--chroot-base-dir", chrootBase, "--netns", netnsPath,
+		"--chroot-base-dir", chrootBase, "--netns", netnsPath(s.Namespace),
 		"--", "--api-sock", "/run/api.sock")
 	cmd.Env = []string{}
 	cmd.Stdout, cmd.Stderr = con, con
@@ -610,7 +658,7 @@ func alive(s state) bool {
 }
 
 func cleanup(s state) {
-	_ = run(ipBin, "-n", netnsName, "link", "del", s.Tap)
+	_ = run(ipBin, "-n", netnsOf(s.Namespace), "link", "del", s.Tap)
 	_ = os.RemoveAll(jailDir(s.ID))
 	_ = os.RemoveAll(userDir(s))
 	_ = os.Remove(statePath(s.ID))

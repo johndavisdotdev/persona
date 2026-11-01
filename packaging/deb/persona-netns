@@ -1,28 +1,58 @@
 #!/usr/bin/env bash
-# persona-netns: shared network namespace for persona microVMs.
-# Installed as /usr/libexec/persona/persona-netns and run by persona-netns.service.
+# persona-netns: network namespaces for persona microVMs.
+# Installed as /usr/libexec/persona/persona-netns and run by persona-netns.service
+# (and by persona-vm, for ns-create / ns-remove).
 #
-# Every microVM's tap device lives in one netns ("persona") on one bridge, so
-# VMs reach each other directly. Egress leaves through a veth pair to the host,
-# which NATs it out of the uplink. The host drops anything from the VMs that is
+# Each persona namespace is a Linux network namespace with one bridge. Every
+# microVM's tap device is on the bridge of its namespace, so VMs in the same
+# namespace reach each other directly (and see each other's multicast), and
+# VMs in different namespaces can't reach each other at all.
+#
+# Every namespace is laid out the same inside (bridge fcbr0, 10.200.0.1/16),
+# so a VM's network config doesn't depend on its namespace. Egress is NATed
+# twice: to the namespace's veth address inside the namespace, then out of
+# the uplink on the host. The host drops anything from the namespaces that is
 # addressed to the host itself or to private/link-local/CGNAT ranges, so VMs
 # get the internet but no other machine on the local network.
 #
-#   persona-netns up                 create/repair everything (idempotent)
-#   persona-netns down               remove everything
+#   namespace  netns            host veth    namespace veth   veth /30
+#   default    persona          fc-host0     fc-ns0           10.199.0.0/30
+#   <name>     persona-<name>   fc-host<N>   fc-ns<N>         10.199.N.0/30
+#
+# Namespaces besides default are listed in $REGISTRY ("<name> <N>" per line),
+# so they come back after a reboot.
+#
+#   persona-netns up                 create/repair every namespace (idempotent)
+#   persona-netns down               remove every namespace
+#   persona-netns add NAME           create a namespace
+#   persona-netns del NAME           remove a namespace
+#   persona-netns list               "<name> <netns>" per line
+#   persona-netns ports              apply the port forwards in $FORWARDS
 #   persona-netns status
+#
+# Port forwards ($FORWARDS, written by persona-vm fw-add / fw-rm; one per line:
+# "<id> <owner uid> <vm id> <namespace> <tcp|udp> <host ip> <host port> <vm ip>
+# <vm port>") expose a VM port on a host address. Every namespace has the same
+# subnet, so the host can't route to a VM: it DNATs host-ip:host-port to the
+# namespace's veth address on port 20000+id, and the namespace DNATs that to
+# the VM. 127.0.0.1 forwards also SNAT to the host's veth address, with
+# route_localnet on that veth, so the replies find their way back.
+# Forwards on a CGNAT address (100.64.0.0/10, the VM's own: 10.200.a.b is
+# 100.64.a.b) are for other spawns, in any namespace: they match only what
+# arrives from the namespaces (-i fc-host+), never the host's own traffic,
+# and SNAT to the host's veth address, so a spawn in the same namespace
+# (whose packets carry that namespace's own address) gets its replies.
 set -euo pipefail
 
-NS=${PERSONA_NETNS:-persona}
+DEFAULT_NETNS=${PERSONA_NETNS:-persona}
+REGISTRY=${PERSONA_NETNS_REGISTRY:-/var/lib/persona/namespaces}
+FORWARDS=${PERSONA_FORWARDS:-/var/lib/persona/forwards}
+INNER_PORT_BASE=20000
 BR=fcbr0
 VM_CIDR=10.200.0.0/16
 BR_ADDR=10.200.0.1/16
-HOST_VETH=fc-host0
-NS_VETH=fc-ns0
-HOST_VETH_ADDR=10.199.0.1/30
-NS_VETH_ADDR=10.199.0.2/30
-HOST_VETH_IP=${HOST_VETH_ADDR%/*}
-NS_VETH_IP=${NS_VETH_ADDR%/*}
+VETH_CIDR=10.199.0.0/16
+MAX_INDEX=255
 UPLINK=${PERSONA_UPLINK:-$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}
 
 # Destinations VMs may never reach: the local network and everything else non-public.
@@ -31,7 +61,29 @@ BLOCKED=(0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.
 
 IPT=${IPTABLES:-iptables}
 IP6T=${IP6TABLES:-ip6tables}
-nsx() { ip netns exec "$NS" "$@"; }
+
+valid_name() { [[ $1 =~ ^[a-z][a-z0-9-]{0,23}$ ]]; }
+
+# netns_of NAME / veth names / addresses of index N.
+netns_of() { if [ "$1" = default ]; then echo "$DEFAULT_NETNS"; else echo "persona-$1"; fi; }
+host_veth() { echo "fc-host$1"; }
+ns_veth() { echo "fc-ns$1"; }
+host_ip() { echo "10.199.$1.1"; }
+ns_ip() { echo "10.199.$1.2"; }
+
+# namespaces prints "<name> <index>" for every namespace, default first.
+namespaces() {
+  echo "default 0"
+  [ -f "$REGISTRY" ] && grep -E '^[a-z][a-z0-9-]* [0-9]+$' "$REGISTRY" || true
+}
+
+index_of() { namespaces | awk -v n="$1" '$1 == n {print $2; exit}'; }
+
+# forwards prints the valid lines of $FORWARDS.
+forwards() {
+  [ -f "$FORWARDS" ] || return 0
+  grep -E '^[0-9]+ [0-9]+ [a-z0-9-]+ [a-z][a-z0-9-]* (tcp|udp) [0-9.]+ [0-9]+ [0-9.]+ [0-9]+$' "$FORWARDS" || true
+}
 
 # ensure_chain BIN TABLE PARENT CHAIN: CHAIN exists, is flushed, and is jumped to first from PARENT.
 ensure_chain() {
@@ -48,98 +100,244 @@ drop_chain() {
   "$bin" -t "$table" -X "$chain" 2>/dev/null || true
 }
 
-up() {
-  [ -n "$UPLINK" ] || { echo "no default route; set PERSONA_UPLINK" >&2; exit 1; }
-  modprobe tun
-  sysctl -qw net.ipv4.ip_forward=1
-
-  # Namespace, bridge, veth.
-  [ -e "/run/netns/$NS" ] || ip netns add "$NS"
+# ns_up NAME N: the namespace, its bridge, its veth pair, and its NAT.
+ns_up() {
+  local name=$1 i=$2 ns hv nv
+  ns=$(netns_of "$name") hv=$(host_veth "$i") nv=$(ns_veth "$i")
+  nsx() { ip netns exec "$ns" "$@"; }
+  [ -e "/run/netns/$ns" ] || ip netns add "$ns"
   nsx sysctl -qw net.ipv4.ip_forward=1
   nsx sysctl -qw net.ipv6.conf.all.disable_ipv6=1
   nsx sysctl -qw net.ipv6.conf.default.disable_ipv6=1
   nsx ip link set lo up
   nsx ip link show "$BR" >/dev/null 2>&1 || nsx ip link add "$BR" type bridge
+  # Flood multicast to every VM. With snooping on and no IGMP querier on the
+  # bridge, group membership expires and delivery (persona-beacon's agent
+  # discovery) depends on timing. Multicast never leaves the bridge: the host
+  # drops 224.0.0.0/4 from the namespaces.
+  nsx ip link set "$BR" type bridge mcast_snooping 0
   nsx ip addr replace "$BR_ADDR" dev "$BR"
   nsx ip link set "$BR" up
 
-  if ! ip link show "$HOST_VETH" >/dev/null 2>&1; then
-    ip link add "$HOST_VETH" type veth peer name "$NS_VETH" netns "$NS"
+  if ! ip link show "$hv" >/dev/null 2>&1; then
+    ip link add "$hv" type veth peer name "$nv" netns "$ns"
   fi
-  ip addr replace "$HOST_VETH_ADDR" dev "$HOST_VETH"
-  ip link set "$HOST_VETH" up
-  nsx ip addr replace "$NS_VETH_ADDR" dev "$NS_VETH"
-  nsx ip link set "$NS_VETH" up
-  nsx ip route replace default via "$HOST_VETH_IP"
-  ip route replace "$VM_CIDR" via "$NS_VETH_IP" dev "$HOST_VETH"
+  ip addr replace "$(host_ip "$i")/30" dev "$hv"
+  ip link set "$hv" up
+  nsx ip addr replace "$(ns_ip "$i")/30" dev "$nv"
+  nsx ip link set "$nv" up
+  nsx ip route replace default via "$(host_ip "$i")"
+
+  # Inside: VM traffic leaves as the namespace's veth address.
+  nsx "$IPT" -t nat -N PERSONA-NAT 2>/dev/null || nsx "$IPT" -t nat -F PERSONA-NAT
+  while nsx "$IPT" -t nat -D POSTROUTING -j PERSONA-NAT 2>/dev/null; do :; done
+  nsx "$IPT" -t nat -I POSTROUTING 1 -j PERSONA-NAT
+  nsx "$IPT" -t nat -A PERSONA-NAT -s "$VM_CIDR" -o "$nv" -j MASQUERADE
+  # Port forwards into this namespace (filled by ns_ports).
+  nsx "$IPT" -t nat -N PERSONA-PORTS 2>/dev/null || true
+  while nsx "$IPT" -t nat -D PREROUTING -j PERSONA-PORTS 2>/dev/null; do :; done
+  nsx "$IPT" -t nat -I PREROUTING 1 -j PERSONA-PORTS
+}
+
+# ns_ports NAME N: the namespace's half of the port forwards: from its veth
+# address on port 20000+id to the VM.
+ns_ports() {
+  local name=$1 i=$2 ns nv id owner vm fns proto hip hport vip vport
+  ns=$(netns_of "$name") nv=$(ns_veth "$i")
+  [ -e "/run/netns/$ns" ] || return 0
+  ip netns exec "$ns" "$IPT" -t nat -F PERSONA-PORTS 2>/dev/null || return 0
+  while read -r id owner vm fns proto hip hport vip vport; do
+    [ "$fns" = "$name" ] || continue
+    ip netns exec "$ns" "$IPT" -t nat -A PERSONA-PORTS -i "$nv" -d "$(ns_ip "$i")" -p "$proto" \
+      --dport $((INNER_PORT_BASE + id)) -j DNAT --to-destination "$vip:$vport"
+  done < <(forwards)
+}
+
+# host_ports: the host's half of the port forwards (called by host_rules,
+# after it has flushed and recreated PERSONA-FWD and PERSONA-NAT).
+host_ports() {
+  local id owner vm ns proto hip hport vip vport i hv nip inner snat=" "
+  "$IPT" -N PERSONA-PORTS 2>/dev/null || "$IPT" -F PERSONA-PORTS
+  "$IPT" -I PERSONA-FWD 1 -j PERSONA-PORTS # ahead of the drops
+  ensure_chain "$IPT" nat PREROUTING PERSONA-DNAT
+  while "$IPT" -t nat -D OUTPUT -j PERSONA-DNAT 2>/dev/null; do :; done
+  "$IPT" -t nat -I OUTPUT 1 -j PERSONA-DNAT # connections from the host itself
+  while read -r id owner vm ns proto hip hport vip vport; do
+    i=$(index_of "$ns")
+    [ -n "$i" ] || continue
+    hv=$(host_veth "$i") nip=$(ns_ip "$i") inner=$((INNER_PORT_BASE + id))
+    if [[ $hip =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]; then # CGNAT: spawns only
+      "$IPT" -t nat -A PERSONA-DNAT -i fc-host+ -d "$hip" -p "$proto" --dport "$hport" -j DNAT --to-destination "$nip:$inner"
+      "$IPT" -t nat -A PERSONA-NAT -o "$hv" -d "$nip" -p "$proto" --dport "$inner" -m conntrack --ctstate DNAT \
+        -j SNAT --to-source "$(host_ip "$i")"
+    else
+      "$IPT" -t nat -A PERSONA-DNAT -d "$hip" -p "$proto" --dport "$hport" -j DNAT --to-destination "$nip:$inner"
+    fi
+    # Both directions of exactly this forward, ahead of the rules that keep
+    # the namespaces off the LAN (a LAN client's replies go to a private range).
+    "$IPT" -A PERSONA-PORTS -o "$hv" -d "$nip" -p "$proto" --dport "$inner" -m conntrack --ctstate DNAT -j ACCEPT
+    "$IPT" -A PERSONA-PORTS -i "$hv" -s "$nip" -p "$proto" --sport "$inner" -m conntrack --ctstate DNAT -j ACCEPT
+    if [ "$hip" = 127.0.0.1 ] && [[ $snat != *" $i "* ]]; then
+      snat+="$i "
+      sysctl -qw "net.ipv4.conf.$hv.route_localnet=1"
+      "$IPT" -t nat -A PERSONA-NAT -o "$hv" -s 127.0.0.0/8 -j SNAT --to-source "$(host_ip "$i")"
+    fi
+  done < <(forwards)
+}
+
+# host_rules: the host's chains, for every namespace's veth.
+host_rules() {
+  local name i hv
+  # VMs used to be routed to the host unNATed; that route is no longer used.
+  ip route del "$VM_CIDR" 2>/dev/null || true
 
   # Host INPUT: VMs can't open connections to the host (runs before ufw's LAN
   # allows). Replies to connections the host opened into a VM are let through.
   ensure_chain "$IPT" filter INPUT PERSONA-IN
-  "$IPT" -A PERSONA-IN -i "$HOST_VETH" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  "$IPT" -A PERSONA-IN -i "$HOST_VETH" -j DROP
-
   # Host FORWARD: replies back in; VMs out to public addresses only.
   ensure_chain "$IPT" filter FORWARD PERSONA-FWD
-  "$IPT" -A PERSONA-FWD -o "$HOST_VETH" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  "$IPT" -A PERSONA-FWD -o "$HOST_VETH" -j DROP
-  "$IPT" -A PERSONA-FWD -i "$HOST_VETH" ! -s "$VM_CIDR" -j DROP
-  for cidr in "${BLOCKED[@]}"; do
-    "$IPT" -A PERSONA-FWD -i "$HOST_VETH" -d "$cidr" -j DROP
-  done
-  "$IPT" -A PERSONA-FWD -i "$HOST_VETH" -o "$UPLINK" -j ACCEPT
-  "$IPT" -A PERSONA-FWD -i "$HOST_VETH" -j DROP
-
   ensure_chain "$IPT" nat POSTROUTING PERSONA-NAT
-  "$IPT" -t nat -A PERSONA-NAT -s "$VM_CIDR" -o "$UPLINK" -j MASQUERADE
-
-  # IPv6 is disabled in the netns; drop anything that slips through anyway.
   if command -v "$IP6T" >/dev/null; then
     ensure_chain "$IP6T" filter INPUT PERSONA-IN
-    "$IP6T" -A PERSONA-IN -i "$HOST_VETH" -j DROP
     ensure_chain "$IP6T" filter FORWARD PERSONA-FWD
-    "$IP6T" -A PERSONA-FWD -i "$HOST_VETH" -j DROP
-    "$IP6T" -A PERSONA-FWD -o "$HOST_VETH" -j DROP
   fi
-  echo "persona netns '$NS' up: bridge $BR ($BR_ADDR), NAT via $UPLINK"
+  while read -r name i; do
+    hv=$(host_veth "$i")
+    "$IPT" -A PERSONA-IN -i "$hv" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    "$IPT" -A PERSONA-IN -i "$hv" -j DROP
+    "$IPT" -A PERSONA-FWD -o "$hv" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    "$IPT" -A PERSONA-FWD -o "$hv" -j DROP
+    "$IPT" -A PERSONA-FWD -i "$hv" ! -s "$(ns_ip "$i")" -j DROP
+    for cidr in "${BLOCKED[@]}"; do
+      "$IPT" -A PERSONA-FWD -i "$hv" -d "$cidr" -j DROP
+    done
+    "$IPT" -A PERSONA-FWD -i "$hv" -o "$UPLINK" -j ACCEPT
+    "$IPT" -A PERSONA-FWD -i "$hv" -j DROP
+    # IPv6 is disabled in the namespaces; drop anything that slips through anyway.
+    if command -v "$IP6T" >/dev/null; then
+      "$IP6T" -A PERSONA-IN -i "$hv" -j DROP
+      "$IP6T" -A PERSONA-FWD -i "$hv" -j DROP
+      "$IP6T" -A PERSONA-FWD -o "$hv" -j DROP
+    fi
+  done < <(namespaces)
+  "$IPT" -t nat -A PERSONA-NAT -s "$VETH_CIDR" -o "$UPLINK" -j MASQUERADE
+  host_ports
+  while read -r name i; do
+    ns_ports "$name" "$i"
+  done < <(namespaces)
 }
 
-# running_vms lists microVMs whose supervisors are alive.
+host_prepare() {
+  [ -n "$UPLINK" ] || { echo "no default route; set PERSONA_UPLINK" >&2; exit 1; }
+  modprobe tun
+  sysctl -qw net.ipv4.ip_forward=1
+}
+
+up() {
+  host_prepare
+  local name i
+  while read -r name i; do
+    ns_up "$name" "$i"
+  done < <(namespaces)
+  host_rules
+  echo "persona namespaces up: $(namespaces | awk '{printf "%s%s", sep, $1; sep=", "}'); NAT via $UPLINK"
+}
+
+# running_vms [NAME] lists microVMs whose supervisors are alive (in namespace NAME).
 running_vms() {
-  local f pid
+  local f pid ns
   for f in /srv/jailer/persona-state/*.json; do
     [ -e "$f" ] || continue
     pid=$(grep -o '"pid":[0-9]*' "$f" | cut -d: -f2)
+    ns=$(grep -o '"namespace":"[^"]*"' "$f" | cut -d'"' -f4)
+    [ -n "${1:-}" ] && [ "${ns:-default}" != "$1" ] && continue
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && basename "$f" .json
   done
 }
 
+ns_down() {
+  local name=$1 i=$2 ns
+  ns=$(netns_of "$name")
+  ip link del "$(host_veth "$i")" 2>/dev/null || true
+  [ -e "/run/netns/$ns" ] && ip netns del "$ns"
+  return 0
+}
+
 down() {
-  # Tearing down the namespace cuts running VMs off the network for good.
-  local vms
+  # Tearing down a namespace cuts its running VMs off the network for good.
+  local vms name i
   vms=$(running_vms)
   if [ -n "$vms" ] && [ -z "${PERSONA_NETNS_FORCE:-}" ]; then
-    echo "persona netns '$NS' left up: microVMs are running ($(echo $vms)); stop them first or set PERSONA_NETNS_FORCE=1" >&2
+    echo "persona namespaces left up: microVMs are running ($(echo $vms)); stop them first or set PERSONA_NETNS_FORCE=1" >&2
     return 0
   fi
   drop_chain "$IPT" nat POSTROUTING PERSONA-NAT
+  drop_chain "$IPT" nat PREROUTING PERSONA-DNAT
+  drop_chain "$IPT" nat OUTPUT PERSONA-DNAT
+  "$IPT" -F PERSONA-PORTS 2>/dev/null || true
   drop_chain "$IPT" filter FORWARD PERSONA-FWD
+  "$IPT" -X PERSONA-PORTS 2>/dev/null || true
   drop_chain "$IPT" filter INPUT PERSONA-IN
   if command -v "$IP6T" >/dev/null; then
     drop_chain "$IP6T" filter FORWARD PERSONA-FWD
     drop_chain "$IP6T" filter INPUT PERSONA-IN
   fi
   ip route del "$VM_CIDR" 2>/dev/null || true
-  ip link del "$HOST_VETH" 2>/dev/null || true
-  [ -e "/run/netns/$NS" ] && ip netns del "$NS"
-  echo "persona netns '$NS' removed"
+  while read -r name i; do
+    ns_down "$name" "$i"
+  done < <(namespaces)
+  echo "persona namespaces removed"
+}
+
+add() {
+  local name=${1:-} i used
+  valid_name "$name" || { echo "invalid namespace name '$name' (lowercase letters, digits and -, starting with a letter, at most 24)" >&2; exit 2; }
+  [ "$name" != default ] && [ -z "$(index_of "$name")" ] || { echo "namespace '$name' already exists" >&2; exit 1; }
+  used=" $(namespaces | awk '{printf "%s ", $2}')"
+  for ((i = 1; i <= MAX_INDEX; i++)); do
+    [[ $used == *" $i "* ]] || break
+  done
+  [ "$i" -le "$MAX_INDEX" ] || { echo "too many namespaces (at most $MAX_INDEX)" >&2; exit 1; }
+  host_prepare
+  # Registered only once it's up, so a failed add leaves nothing behind that
+  # up would recreate. (set -e doesn't apply inside `if ! ns_up`, so a failing
+  # step exits the script and the trap undoes the rest.)
+  ADD_NAME=$name ADD_INDEX=$i
+  trap 'ns_down "$ADD_NAME" "$ADD_INDEX"; echo "could not create namespace '"'"'$ADD_NAME'"'"'" >&2' EXIT
+  ns_up "$name" "$i"
+  trap - EXIT
+  mkdir -p "$(dirname "$REGISTRY")"
+  echo "$name $i" >> "$REGISTRY"
+  host_rules
+  echo "created namespace '$name' (netns $(netns_of "$name"))"
+}
+
+del() {
+  local name=${1:-} i vms
+  [ "$name" != default ] || { echo "the default namespace can't be removed" >&2; exit 1; }
+  i=$(index_of "$name")
+  [ -n "$i" ] || { echo "no namespace '$name'" >&2; exit 1; }
+  vms=$(running_vms "$name")
+  [ -z "$vms" ] || { echo "microVMs are running in '$name': $(echo $vms)" >&2; exit 1; }
+  ns_down "$name" "$i"
+  sed -i "/^$name /d" "$REGISTRY"
+  host_rules
+  echo "removed namespace '$name'"
 }
 
 case "${1:-}" in
   up) up ;;
   down) down ;;
+  add) add "${2:-}" ;;
+  del) del "${2:-}" ;;
+  list) namespaces | while read -r name i; do echo "$name $(netns_of "$name")"; done ;;
+  ports) host_prepare; host_rules ;;
   status)
-    nsx ip -br addr; nsx bridge link
+    namespaces | while read -r name i; do
+      ns=$(netns_of "$name")
+      echo "== $name (netns $ns)"
+      ip netns exec "$ns" ip -br addr || true
+    done
     "$IPT" -S PERSONA-FWD; "$IPT" -t nat -S PERSONA-NAT ;;
-  *) echo "usage: $0 {up|down|status}" >&2; exit 2 ;;
+  *) echo "usage: $0 {up|down|add NAME|del NAME|list|ports|status}" >&2; exit 2 ;;
 esac

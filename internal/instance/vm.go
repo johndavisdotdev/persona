@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"github.com/johndavisdev/persona/internal/docker"
 	"github.com/johndavisdev/persona/internal/microvm"
 	"github.com/johndavisdev/persona/internal/persona"
+	"github.com/johndavisdev/persona/internal/status"
 )
 
 // VM runs instances as Firecracker microVMs. Images are still built with
@@ -78,10 +80,20 @@ type record struct {
 	IP       string    `json:"ip"`
 	Image    string    `json:"image"`
 	Created  time.Time `json:"created"`
-	// From the image config: who and how the session runs.
-	User string   `json:"user"`
-	Env  []string `json:"env"`
-	Cwd  string   `json:"cwd"` // guest directory Claude Code starts in
+	Started  time.Time `json:"started,omitempty"` // last (re)start
+	// From the image config: who and how the session runs. Kept so the spawn
+	// can restart, or be saved, after its persona is deleted or rebuilt.
+	User       string   `json:"user"`
+	Env        []string `json:"env"`
+	Entrypoint []string `json:"entrypoint,omitempty"`
+	Cwd        string   `json:"cwd"` // guest directory Claude Code starts in
+	ClaudeArgs string   `json:"claude_args,omitempty"`
+	// Disks (in DisksDir): a hard link to the image's root disk, shared and
+	// read-only, and the spawn's writable disk while it is stopped.
+	Rootfs string `json:"rootfs,omitempty"`
+	Disk   string `json:"disk,omitempty"`
+	// Stores are hard links to the image's /nix/store layers (see microvm.Store).
+	Stores []string `json:"stores,omitempty"`
 	// Git workspaces: the host repo, this instance's worktree and branch, and
 	// the branch pull requests target.
 	Repo     string `json:"repo,omitempty"`
@@ -90,6 +102,15 @@ type record struct {
 	Base     string `json:"base,omitempty"`
 	// Plain directories are copied in and back out on stop.
 	HostDir string `json:"host_dir,omitempty"`
+	// Namespace is the persona network namespace ("" is DefaultNamespace).
+	Namespace string `json:"namespace,omitempty"`
+}
+
+func (r *record) namespace() string {
+	if r.Namespace == "" {
+		return DefaultNamespace
+	}
+	return r.Namespace
 }
 
 const guestWorkspace = "/workspace"
@@ -110,6 +131,9 @@ func vmID(name string) string {
 }
 
 func recordPath(name string) string { return filepath.Join(config.InstancesDir(), name+".json") }
+
+// disksDir holds a spawn's disks while it exists.
+func disksDir(name string) string { return filepath.Join(config.InstancesDir(), name+".disks") }
 
 func loadRecord(name string) (*record, error) {
 	b, err := os.ReadFile(recordPath(name))
@@ -198,10 +222,14 @@ func (v *VM) List(ctx context.Context, personaName string) ([]Container, error) 
 			continue
 		}
 		c := Container{ID: r.VMID, Name: r.Name, Persona: r.Persona, Instance: r.Instance, Image: r.Image,
-			Created: r.Created.Format(time.RFC3339), State: "exited", Status: "Stopped"}
+			Created: r.Created.Format(time.RFC3339), State: "exited", Status: "Stopped", Namespace: r.namespace(), IP: r.IP}
 		if running[r.VMID] {
 			c.State = "running"
-			c.Status = fmt.Sprintf("Up %s · microVM %s", humanDuration(time.Since(r.Created)), r.IP)
+			since := r.Started
+			if since.IsZero() {
+				since = r.Created
+			}
+			c.Status = fmt.Sprintf("Up %s · microVM %s", humanDuration(time.Since(since)), r.IP)
 		}
 		if r.Branch != "" {
 			c.Status += " · " + r.Branch
@@ -226,6 +254,7 @@ func humanDuration(d time.Duration) string {
 
 // imageConfig is the part of a Docker image's config a VM session honours.
 type imageConfig struct {
+	Labels     map[string]string
 	Env        []string
 	User       string
 	WorkingDir string
@@ -245,15 +274,34 @@ func (v *VM) inspect(ctx context.Context, image string) (string, imageConfig, er
 
 // rootfs returns the read-only root disk for an image, exporting it once per
 // image and agent build.
-func (v *VM) rootfs(ctx context.Context, personaName, image, imageID string, log io.Writer) (string, error) {
+func (v *VM) rootfs(ctx context.Context, personaName, image, imageID string, cfg imageConfig, log io.Writer) (string, []string, error) {
 	agentBin, err := os.ReadFile(v.Agent)
 	if err != nil {
-		return "", fmt.Errorf("read persona-agent: %w", err)
+		return "", nil, fmt.Errorf("read persona-agent: %w", err)
 	}
-	sum := sha256.Sum256(agentBin)
+	// The kernel runs it before anything is mounted, /nix/store included.
+	if f, err := elf.NewFile(bytes.NewReader(agentBin)); err == nil {
+		for _, p := range f.Progs {
+			if p.Type == elf.PT_INTERP {
+				return "", nil, fmt.Errorf("%s is dynamically linked; persona-agent runs as the microVM's init and must be static (build with CGO_ENABLED=0)", v.Agent)
+			}
+		}
+	}
+	extra := map[string]microvm.File{microvm.AgentPath: {Data: agentBin, Mode: 0o755}}
+	edits := map[string]microvm.Edit{}
+	h := sha256.New()
+	h.Write(agentBin)
+	// An image whose /nix/store is just what Nix built shares it through the
+	// store (see microvm.Store); one changed by hand (persona customize) has
+	// its own copy.
+	split := cfg.Labels[persona.LabelStore] != persona.StorePrivate
+	if split {
+		h.Write([]byte("store-v1"))
+	}
+	sum := h.Sum(nil)
 	dir := filepath.Join(config.VMDir(), "images")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	_ = os.Chmod(config.VMDir(), 0o755)
 	_ = os.Chmod(dir, 0o755)
@@ -264,36 +312,100 @@ func (v *VM) rootfs(ctx context.Context, personaName, image, imageID string, log
 	}
 	path := filepath.Join(dir, fmt.Sprintf("%s-%s-%s.ext4", prefix, id, hex.EncodeToString(sum[:4])))
 	if _, err := os.Stat(path); err == nil {
-		return path, nil
+		layers, err := readLayers(path)
+		if err == nil {
+			return path, storeDisks(layers), nil
+		}
+		// A disk without its layer list is incomplete: export it again.
 	}
 	fmt.Fprintf(log, "Exporting %s to a microVM disk…\n", image)
 	tmp := path + ".partial"
-	if err := microvm.ExportRootfs(ctx, v.Docker, image, tmp,
-		map[string]microvm.File{microvm.AgentPath: {Data: agentBin, Mode: 0o755}}); err != nil {
-		return "", err
+	var layers []string
+	if split {
+		layers, err = microvm.ExportSplit(ctx, v.Docker, image, tmp, extra, edits, store())
+	} else {
+		err = microvm.ExportRootfs(ctx, v.Docker, image, tmp, extra, edits)
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	if err := writeLayers(path, layers); err != nil {
+		return "", nil, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	// Older exports of this persona are unused by new instances. Running ones
-	// keep their hard link inside the jail, so removing these is safe.
-	old, _ := filepath.Glob(filepath.Join(dir, prefix+"-*.ext4"))
-	for _, o := range old {
-		if o != path && !strings.HasSuffix(o, ".partial") {
-			os.Remove(o)
+	// keep their hard links inside the jail, so removing these is safe.
+	for _, o := range imageDisks(prefix) {
+		if o != path {
+			removeDisk(o)
 		}
 	}
-	return path, nil
+	gcStore()
+	return path, storeDisks(layers), nil
+}
+
+// store is the shared /nix/store of every microVM disk.
+func store() microvm.Store { return microvm.Store{Dir: filepath.Join(config.VMDir(), "store")} }
+
+func storeDisks(layers []string) []string {
+	var out []string
+	for _, l := range layers {
+		out = append(out, store().Disk(l))
+	}
+	return out
+}
+
+// An image disk's store layers are listed next to it, in <disk>.layers.
+func layersPath(disk string) string { return strings.TrimSuffix(disk, ".ext4") + ".layers" }
+
+func readLayers(disk string) ([]string, error) {
+	b, err := os.ReadFile(layersPath(disk))
+	if errors.Is(err, os.ErrNotExist) {
+		if _, statErr := os.Stat(disk); statErr == nil {
+			return nil, nil // exported before the store: everything is in the disk
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(string(b)), nil
+}
+
+func writeLayers(disk string, layers []string) error {
+	return os.WriteFile(layersPath(disk), []byte(strings.Join(layers, "\n")+"\n"), 0o644)
+}
+
+func removeDisk(disk string) {
+	os.Remove(disk)
+	os.Remove(layersPath(disk))
+}
+
+// gcStore deletes store layers no image disk uses. Spawns hold their own
+// hard links, so their layers live on until they are killed.
+func gcStore() {
+	inUse := map[string]bool{}
+	entries, _ := os.ReadDir(filepath.Join(config.VMDir(), "images"))
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".layers") {
+			b, _ := os.ReadFile(filepath.Join(config.VMDir(), "images", e.Name()))
+			for _, l := range strings.Fields(string(b)) {
+				inUse[l] = true
+			}
+		}
+	}
+	_ = store().GC(inUse)
 }
 
 // Prepare exports image's microVM disk and creates the blank overlay disk,
 // unless they already exist. Spawn does the same on a cache miss.
 func (v *VM) Prepare(ctx context.Context, personaName, image string) error {
-	imageID, _, err := v.inspect(ctx, image)
+	imageID, cfg, err := v.inspect(ctx, image)
 	if err != nil {
 		return err
 	}
-	if _, err := v.rootfs(ctx, personaName, image, imageID, io.Discard); err != nil {
+	if _, _, err := v.rootfs(ctx, personaName, image, imageID, cfg, io.Discard); err != nil {
 		return err
 	}
 	_, err = v.overlay(ctx)
@@ -329,7 +441,7 @@ func (v *VM) Run(ctx context.Context, o RunOptions) (name string, err error) {
 	if err != nil {
 		return "", err
 	}
-	rootfs, err := v.rootfs(ctx, o.Persona, image, imageID, log)
+	rootfs, stores, err := v.rootfs(ctx, o.Persona, image, imageID, cfg, log)
 	if err != nil {
 		return "", err
 	}
@@ -338,6 +450,15 @@ func (v *VM) Run(ctx context.Context, o RunOptions) (name string, err error) {
 		return "", err
 	}
 
+	ns := o.Namespace
+	if ns == DefaultNamespace {
+		ns = ""
+	}
+	if ns != "" {
+		if err := v.checkNamespace(ctx, ns); err != nil {
+			return "", err
+		}
+	}
 	name = docker.ContainerName(o.Persona, o.Instance)
 	unlock, err := lockInstances()
 	if err != nil {
@@ -358,7 +479,8 @@ func (v *VM) Run(ctx context.Context, o RunOptions) (name string, err error) {
 		user = "root"
 	}
 	rec := &record{Name: name, Persona: o.Persona, Instance: o.Instance, VMID: vmID(name), IP: ip.String(),
-		Image: image, Created: time.Now(), User: user, Env: cfg.Env, Cwd: guestWorkspace}
+		Image: image, Created: time.Now(), Started: time.Now(), User: user, Env: cfg.Env, Cwd: guestWorkspace, ClaudeArgs: o.ClaudeArgs,
+		Entrypoint: append(append([]string{}, cfg.Entrypoint...), cfg.Cmd...), Namespace: ns}
 	err = rec.save()
 	unlock()
 	if err != nil {
@@ -374,6 +496,14 @@ func (v *VM) Run(ctx context.Context, o RunOptions) (name string, err error) {
 		}
 	}()
 
+	// The spawn keeps its own hard link to the root disk, so rebuilding or
+	// deleting the persona never affects it.
+	if rec.Rootfs, err = linkDisk(rootfs, rec.Name); err != nil {
+		return "", err
+	}
+	if rec.Stores, err = linkStores(stores, rec.Name); err != nil {
+		return "", err
+	}
 	src, cleanup, err := prepareWorkspace(ctx, rec, o.Workdir, log)
 	if err != nil {
 		return "", err
@@ -383,8 +513,8 @@ func (v *VM) Run(ctx context.Context, o RunOptions) (name string, err error) {
 		return "", err
 	}
 
-	vm, err = microvm.Start(ctx, microvm.Spec{ID: rec.VMID, Kernel: v.Kernel, Rootfs: rootfs, Overlay: overlay,
-		VCPUs: v.VCPUs, MemMiB: v.MemMiB, IP: ip})
+	vm, err = microvm.Start(ctx, microvm.Spec{ID: rec.VMID, Kernel: v.Kernel, Rootfs: rec.Rootfs, Stores: rec.Stores, Overlay: overlay,
+		VCPUs: v.VCPUs, MemMiB: v.MemMiB, IP: ip, Namespace: rec.Namespace, Spawn: rec.Instance, Persona: rec.Persona})
 	if err != nil {
 		return "", err
 	}
@@ -400,20 +530,60 @@ func (v *VM) Run(ctx context.Context, o RunOptions) (name string, err error) {
 	if err := v.configureGuest(ctx, rec, vm, o); err != nil {
 		return "", err
 	}
-	argv := append(append([]string{}, cfg.Entrypoint...), cfg.Cmd...)
-	if len(argv) == 0 {
-		return "", fmt.Errorf("image %s has no entrypoint", image)
+	if err := v.startSession(ctx, rec, vm, log); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// startSession launches the image's entrypoint (Claude Code in tmux).
+func (v *VM) startSession(ctx context.Context, rec *record, vm *microvm.VM, log io.Writer) error {
+	if len(rec.Entrypoint) == 0 {
+		return fmt.Errorf("image %s has no entrypoint", rec.Image)
 	}
 	if _, err := vm.Agent.Run(ctx, agent.Exec{User: rec.User, Env: rec.Env, Dir: rec.Cwd, Detach: true,
-		Argv: append([]string{"/bin/sh", "-c", `. /run/persona/env && exec "$@"`, "sh"}, argv...)}); err != nil {
-		return "", fmt.Errorf("start session: %w", err)
+		Argv: append([]string{"/bin/sh", "-c", `. /run/persona/env && exec "$@"`, "sh"}, rec.Entrypoint...)}); err != nil {
+		return fmt.Errorf("start session: %w", err)
 	}
-	if rec.Repo != "" && v.Self != "" {
+	if v.Self != "" { // status events for every spawn; push/pr for git ones
 		if err := EnsureBroker(v.Self); err != nil {
 			fmt.Fprintf(log, "warning: push broker not started: %v\n", err)
 		}
 	}
-	return name, nil
+	return nil
+}
+
+// linkDisk hard links a shared root disk into a spawn's disks directory
+// (copying it if the filesystems differ).
+// linkStores gives a spawn its own hard links to its store layers.
+func linkStores(srcs []string, name string) ([]string, error) {
+	var out []string
+	for _, src := range srcs {
+		dir := disksDir(name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+		dst := filepath.Join(dir, "store-"+filepath.Base(src))
+		_ = os.Remove(dst)
+		if err := os.Link(src, dst); err != nil {
+			dst = src // e.g. across filesystems: fall back to the shared path
+		}
+		out = append(out, dst)
+	}
+	return out, nil
+}
+
+func linkDisk(src, name string) (string, error) {
+	dir := disksDir(name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	dst := filepath.Join(dir, "rootfs.ext4")
+	_ = os.Remove(dst)
+	if err := os.Link(src, dst); err != nil {
+		return src, nil // e.g. across filesystems: fall back to the shared path
+	}
+	return dst, nil
 }
 
 // configureGuest delivers secrets and per-instance settings.
@@ -455,8 +625,9 @@ func (v *VM) configureGuest(ctx context.Context, rec *record, vm *microvm.VM, o 
 			}
 		}
 		note := fmt.Sprintf(vmClaudeMD, rec.Branch, rec.Branch, rec.Base)
+		// Claude Code reads ~/.claude/CLAUDE.md; pi reads ~/.pi/agent/AGENTS.md.
 		if _, err := vm.Agent.Run(ctx, agent.Exec{User: rec.User, Env: rec.Env, Stdin: []byte(note),
-			Argv: []string{"/bin/sh", "-c", `mkdir -p "$HOME/.claude" && cat >> "$HOME/.claude/CLAUDE.md"`}}); err != nil {
+			Argv: []string{"/bin/sh", "-c", `f="$HOME/.claude/CLAUDE.md"; [ "${PERSONA_HARNESS:-}" = pi ] && f="$HOME/.pi/agent/AGENTS.md"; mkdir -p "$(dirname "$f")"; grep -qF "## This instance's workspace" "$f" 2>/dev/null || cat >> "$f"`}}); err != nil {
 			return err
 		}
 	}
@@ -472,8 +643,10 @@ your work there. This VM has no GitHub credentials, so ` + "`git push`" + ` will
 
 - ` + "`persona-agent push`" + ` pushes ` + "`%s`" + ` to GitHub using the host's credentials.
 - ` + "`persona-agent pr --title \"...\" --body \"...\"`" + ` pushes and opens a pull request against ` + "`%s`" + `.
+- ` + "`persona-agent fetch [branch...]`" + ` brings the host's branches in as ` + "`host/<branch>`" + `
+  (default: the pull request base), e.g. before ` + "`git rebase host/main`" + `. ` + "`git fetch`" + ` won't work.
 
-Only this branch can be pushed, and only committed work is pushed.
+Only this branch can be pushed, and only committed work is pushed. The persona:git skill has the details.
 `
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
@@ -512,7 +685,13 @@ func RshMain(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: __vm-rsh VSOCK USER HOST COMMAND...")
 		return 2
 	}
-	conn, err := agent.Client{Vsock: args[0]}.Stream(context.Background(), agent.Exec{Argv: args[3:], User: args[1]})
+	argv := args[3:]
+	// git (like ssh) passes the remote command as one string to be run by a
+	// shell: "git-receive-pack '/workspace'". rsync passes separate arguments.
+	if len(argv) == 1 && strings.ContainsAny(argv[0], " '") {
+		argv = []string{"/bin/sh", "-c", argv[0]}
+	}
+	conn, err := agent.Client{Vsock: args[0]}.Stream(context.Background(), agent.Exec{Argv: argv, User: args[1]})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -549,10 +728,10 @@ func (v *VM) AttachCommand(ctx context.Context, name string) *exec.Cmd {
 	return cmd
 }
 
-// Stop saves the session's work to the host and stops the VM: commits land
-// on the instance's branch (fast-forwarding its worktree), and uncommitted
-// changes are copied into the worktree, so nothing is lost. The record stays
-// until Remove.
+// Stop saves the session's work to the host and stops the VM, keeping the
+// spawn so Start can resume it: commits land on its branch (fast-forwarding
+// the worktree) and uncommitted changes are copied into the worktree, then the
+// VM's writable disk is copied out of its jail.
 func (v *VM) Stop(ctx context.Context, name string) error {
 	rec, vm, err := v.lookup(name)
 	if err != nil {
@@ -565,15 +744,139 @@ func (v *VM) Stop(ctx context.Context, name string) error {
 		if err := v.saveWork(ctx, rec, vm); err != nil {
 			return fmt.Errorf("%s: saving work failed, VM left running (--force stops it anyway, losing that work): %w", name, err)
 		}
+		if err := vm.Agent.Quiesce(ctx); err != nil {
+			return fmt.Errorf("%s: flushing disks: %w", name, err)
+		}
+		dir := disksDir(rec.Name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		if err := vm.SaveDisk(ctx, dir); err != nil {
+			return fmt.Errorf("%s: saving its disk failed, VM left paused: %w", name, err)
+		}
+		rec.Disk = filepath.Join(dir, microvm.DiskName)
+		if err := rec.save(); err != nil {
+			return err
+		}
 	}
 	return microvm.Stop(ctx, rec.VMID)
+}
+
+// Start resumes a stopped spawn from its disks: same name, address, branch
+// and files, with a fresh Claude Code session and current credentials.
+func (v *VM) Start(ctx context.Context, name string, env []string) error {
+	rec, err := loadRecord(name)
+	if err != nil {
+		return err
+	}
+	if _, running := microvm.Lookup(rec.VMID); running {
+		return nil
+	}
+	if len(rec.Entrypoint) == 0 || rec.Rootfs == "" {
+		// Records from before spawns were restartable: use the persona's image.
+		imageID, cfg, err := v.inspect(ctx, rec.Image)
+		if err != nil {
+			return fmt.Errorf("%s: its image is gone (%w); kill it and spawn again", name, err)
+		}
+		rec.Entrypoint = append(append([]string{}, cfg.Entrypoint...), cfg.Cmd...)
+		rootfs, stores, err := v.rootfs(ctx, rec.Persona, rec.Image, imageID, cfg, io.Discard)
+		if err != nil {
+			return err
+		}
+		if rec.Rootfs, err = linkDisk(rootfs, rec.Name); err != nil {
+			return err
+		}
+		if rec.Stores, err = linkStores(stores, rec.Name); err != nil {
+			return err
+		}
+	}
+	disk := rec.Disk
+	if _, err := os.Stat(disk); disk == "" || err != nil {
+		if disk, err = v.overlay(ctx); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "warning: %s has no saved disk (it was stopped before spawns kept one, or with --force); it starts from a clean disk\n", name)
+	}
+	rec.Started = time.Now()
+	if err := rec.save(); err != nil {
+		return err
+	}
+	vm, err := microvm.Start(ctx, microvm.Spec{ID: rec.VMID, Kernel: v.Kernel, Rootfs: rec.Rootfs, Stores: rec.Stores, Overlay: disk,
+		VCPUs: v.VCPUs, MemMiB: v.MemMiB, IP: net.ParseIP(rec.IP), Namespace: rec.Namespace, Spawn: rec.Instance, Persona: rec.Persona})
+	if err != nil {
+		return err
+	}
+	if err := v.configureGuest(ctx, rec, vm, RunOptions{Env: env, ClaudeArgs: rec.ClaudeArgs}); err == nil {
+		err = v.startSession(ctx, rec, vm, io.Discard)
+	}
+	if err != nil {
+		vm.Stop()
+		return err
+	}
+	return nil
+}
+
+// Save captures a running spawn's filesystem (without /workspace, which every
+// spawn refills, or runtime mounts such as /proc and /run) as the image for
+// persona newPersona, then prepares its microVM disk. The spawn keeps running.
+func (v *VM) Save(ctx context.Context, name, newPersona string) error {
+	rec, vm, err := v.lookup(name)
+	if err != nil {
+		if rec != nil {
+			return fmt.Errorf("%w; start it first (`persona start %s`)", err, rec.Instance)
+		}
+		return err
+	}
+	if len(rec.Entrypoint) == 0 {
+		if _, cfg, err := v.inspect(ctx, rec.Image); err == nil {
+			rec.Entrypoint = append(append([]string{}, cfg.Entrypoint...), cfg.Cmd...)
+		}
+	}
+	conn, err := vm.Agent.Stream(ctx, agent.Exec{User: "root", Dir: "/", Argv: []string{"tar",
+		"--create", "--file=-", "--one-file-system", "--numeric-owner", "--xattrs", "--acls",
+		"--exclude=./workspace/*", "--exclude=./.oldroot", "--exclude=./etc/persona/nix-fallback", "."}})
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	image := persona.ImageFor(newPersona)
+	if err := docker.Import(ctx, conn, image, imageChanges(rec, newPersona)); err != nil {
+		return err
+	}
+	return v.Prepare(ctx, newPersona, image)
+}
+
+// imageChanges recreate a spawn's image config on a saved image.
+func imageChanges(rec *record, newPersona string) []string {
+	changes := []string{
+		"USER " + rec.User,
+		"WORKDIR " + guestWorkspace,
+		fmt.Sprintf("LABEL %s=%q %s=%q", persona.LabelManaged, "true", persona.LabelName, newPersona),
+	}
+	for _, kv := range rec.Env {
+		if k, val, ok := strings.Cut(kv, "="); ok {
+			changes = append(changes, fmt.Sprintf("ENV %s=%q", k, val))
+		}
+	}
+	if len(rec.Entrypoint) > 0 {
+		ep, _ := json.Marshal(rec.Entrypoint)
+		changes = append(changes, "ENTRYPOINT "+string(ep))
+	}
+	return changes
 }
 
 func (v *VM) saveWork(ctx context.Context, rec *record, vm *microvm.VM) error {
 	switch {
 	case rec.Worktree != "":
-		if _, err := fetchBranch(ctx, rec, vm); err != nil {
-			return err
+		if _, err := fetchBranch(ctx, rec, vm, fastForward); err != nil {
+			// The spawn rewrote its branch (a rebase): its history wins, as
+			// its files are about to. The old head stays in the reflog.
+			old, _ := git(ctx, rec.Worktree, "rev-parse", "--short", "HEAD")
+			if _, ferr := fetchBranch(ctx, rec, vm, replaceAll); ferr != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "note: %s: the spawn rewrote %s; the worktree now has its history (was %s; see git reflog)\n",
+				rec.Instance, rec.Branch, old)
 		}
 		return v.rsync(ctx, rec, vm, "--delete", "--exclude=/.git", "--filter=:- .gitignore",
 			"vm:"+guestWorkspace+"/", rec.Worktree+"/")
@@ -583,17 +886,27 @@ func (v *VM) saveWork(ctx context.Context, rec *record, vm *microvm.VM) error {
 	return nil
 }
 
-// Remove deletes the record and the worktree. The branch is always kept; a
-// worktree with uncommitted changes is kept too (reported as a KeptError).
+// Remove kills a spawn: a running one saves its work to the host first (as
+// Stop does, without keeping its disk), then the VM, its disks, record and
+// worktree go. The branch is always kept; a worktree with uncommitted changes
+// is kept too (reported as a KeptError).
 func (v *VM) Remove(ctx context.Context, name string) error {
 	rec, err := loadRecord(name)
 	if err != nil {
 		return err
 	}
-	if _, running := microvm.Lookup(rec.VMID); running {
-		if err := v.Stop(ctx, name); err != nil {
+	if vm, running := microvm.Lookup(rec.VMID); running {
+		if !forced(ctx) {
+			if err := v.saveWork(ctx, rec, vm); err != nil {
+				return fmt.Errorf("%s: saving work failed, VM left running (--force kills it anyway, losing that work): %w", name, err)
+			}
+		}
+		if err := microvm.Stop(ctx, rec.VMID); err != nil {
 			return err
 		}
+	}
+	if err := microvm.RemoveForwardsTo(ctx, rec.VMID); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %s: removing its port forwards: %v\n", name, err)
 	}
 	return v.discard(ctx, rec)
 }
@@ -608,8 +921,40 @@ func (v *VM) discard(ctx context.Context, rec *record) error {
 			}
 		}
 	}
+	if err := os.RemoveAll(disksDir(rec.Name)); err != nil {
+		return err
+	}
+	_ = status.Remove(rec.Instance)
 	if err := os.Remove(recordPath(rec.Name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return kept
+}
+
+// imageDisks lists the cached microVM disks of one persona: exactly
+// <persona>-<image id>-<agent hash>.ext4, so "app" never matches "app-v2".
+func imageDisks(prefix string) []string {
+	re := regexp.MustCompile(`^` + regexp.QuoteMeta(prefix) + `-[0-9a-f]{12}-[0-9a-f]{8}\.ext4$`)
+	entries, _ := os.ReadDir(filepath.Join(config.VMDir(), "images"))
+	var out []string
+	for _, e := range entries {
+		if re.MatchString(e.Name()) {
+			out = append(out, filepath.Join(config.VMDir(), "images", e.Name()))
+		}
+	}
+	return out
+}
+
+// ForgetImages deletes the cached microVM disks of a persona's images.
+// Spawns keep their own hard links, so they are unaffected.
+func (v *VM) ForgetImages(personaName string) error {
+	prefix := regexp.MustCompile(`[^a-z0-9-]+`).ReplaceAllString(personaName, "-")
+	for _, p := range imageDisks(prefix) {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		os.Remove(layersPath(p))
+	}
+	gcStore()
+	return nil
 }

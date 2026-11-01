@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "ag-dev": {
+      "source": "ag-grid/skills",
+      "sourceType": "github",
+      "skillPath": "skills/ag-dev/SKILL.md",
+      "computedHash": "4f0070073a856fad173abe32ead6b041c1ab5de98cf1c9cf8a4ac2e3fc92ec0e"
+    }
+  }
+}

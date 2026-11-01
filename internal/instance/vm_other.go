@@ -23,8 +23,12 @@ func (unsupported) Run(context.Context, RunOptions) (string, error) { return "",
 func (unsupported) List(context.Context, string) ([]Container, error) {
 	return nil, errLinuxOnly
 }
-func (unsupported) Stop(context.Context, string) error   { return errLinuxOnly }
-func (unsupported) Remove(context.Context, string) error { return errLinuxOnly }
+func (unsupported) Stop(context.Context, string) error { return errLinuxOnly }
+func (unsupported) Start(context.Context, string, []string) error {
+	return errLinuxOnly
+}
+func (unsupported) Save(context.Context, string, string) error { return errLinuxOnly }
+func (unsupported) Remove(context.Context, string) error       { return errLinuxOnly }
 func (unsupported) Exec(context.Context, string, ...string) ([]byte, error) {
 	return nil, errLinuxOnly
 }

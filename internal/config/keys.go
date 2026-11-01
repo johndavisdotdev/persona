@@ -9,10 +9,12 @@ import (
 	"github.com/spf13/viper"
 )
 
-// APIKeys are the keys `persona configure` stores for the persona designer.
+// APIKeys are the keys `persona configure` stores: Anthropic and Exa for the
+// persona designer, OpenRouter for spawns.
 type APIKeys struct {
-	Anthropic string `json:"anthropic_api_key,omitempty"`
-	Exa       string `json:"exa_api_key,omitempty"`
+	Anthropic  string `json:"anthropic_api_key,omitempty"`
+	Exa        string `json:"exa_api_key,omitempty"`
+	OpenRouter string `json:"openrouter_api_key,omitempty"`
 }
 
 // CredentialsDir holds secrets, readable only by the user.
@@ -75,6 +77,9 @@ func applyStoredKeys() error {
 	}
 	if k.Exa != "" {
 		viper.SetDefault(KeyExaAPIKey, k.Exa)
+	}
+	if k.OpenRouter != "" {
+		viper.SetDefault(KeyOpenRouterAPIKey, k.OpenRouter)
 	}
 	return nil
 }

@@ -1,0 +1,19 @@
+{
+  "name": "persona",
+  "description": "Plugins for persona agents",
+  "owner": {
+    "name": "John Davis"
+  },
+  "plugins": [
+    {
+      "name": "beacon",
+      "source": "./plugins/beacon",
+      "description": "Discover and message the other persona agents on this machine, and reach the persona host"
+    },
+    {
+      "name": "persona",
+      "source": "./plugins/persona",
+      "description": "Skills for agents running as persona spawns: the spawn's git workspace (persona-agent push, pr, fetch)"
+    }
+  ]
+}

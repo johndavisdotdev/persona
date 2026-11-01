@@ -18,7 +18,9 @@ func TestStoredKeysAreLowestPrecedence(t *testing.T) {
 	if err := Init("", home); err != nil {
 		t.Fatal(err)
 	}
-	if err := SaveAPIKeys(APIKeys{Anthropic: "stored-a", Exa: "stored-e"}); err != nil {
+	os.Unsetenv("OPENROUTER_API_KEY")
+	os.Unsetenv("PERSONA_OPENROUTER_API_KEY")
+	if err := SaveAPIKeys(APIKeys{Anthropic: "stored-a", Exa: "stored-e", OpenRouter: "stored-o"}); err != nil {
 		t.Fatal(err)
 	}
 	if fi, err := os.Stat(APIKeysPath()); err != nil || fi.Mode().Perm() != 0o600 {
@@ -37,6 +39,9 @@ func TestStoredKeysAreLowestPrecedence(t *testing.T) {
 	}
 	if got := viper.GetString(KeyExaAPIKey); got != "stored-e" {
 		t.Errorf("exa = %q", got)
+	}
+	if got := viper.GetString(KeyOpenRouterAPIKey); got != "stored-o" {
+		t.Errorf("openrouter = %q", got)
 	}
 	viper.Reset()
 }

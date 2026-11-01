@@ -24,7 +24,7 @@ func newRoot() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "persona",
 		Short: "Build, spawn, and multiplex containerized Claude Code personas",
-		Long: `Build, spawn, and multiplex containerized Claude Code personas: minimal Debian
+		Long: `Build, spawn, and multiplex containerized Claude Code personas: minimal Nix-built
 images with the plugins, skills, and MCP servers a role needs already installed.`,
 		Example: `  # design a persona with AI (interactive wizard)
   persona new
@@ -39,6 +39,10 @@ images with the plugins, skills, and MCP servers a role needs already installed.
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			h, _ := cmd.Flags().GetString("home")
+			if h != "" {
+				// Helpers persona starts (the broker, __vm-attach) inherit it.
+				os.Setenv("PERSONA_HOME", h)
+			}
 			return config.Init(cfgFile, h)
 		},
 	}
@@ -52,18 +56,29 @@ images with the plugins, skills, and MCP servers a role needs already installed.
 		newDeleteCmd(),
 		newUpdateCmd(),
 		newEditCmd(),
+		newCustomizeCmd(),
 		newSpawnCmd(),
+		newPsCmd(),
+		newAttachCmd(),
 		newStopCmd(),
-		newJoinCmd(),
+		newStartCmd(),
+		newSaveCmd(),
+		newKillCmd(),
 		newControlCenterCmd(),
+		newManageCmd(),
 		newBuildCmd(),
 		newBaseCmd(),
 		newEditBaseCmd(),
 		newConfigureCmd(),
 		newAuthCmd(),
 		newBrokerCmd(),
+		newMessageCmd(),
+		newExecCmd(),
+		newServerCmd(),
 		newVMAttachCmd(),
 		newVMRshCmd(),
+		newNSCmd(),
+		newFWCmd(),
 	)
 	styleHelp(root)
 	return root
@@ -84,6 +99,10 @@ func Execute() int {
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	if err := root.ExecuteContext(ctx); err != nil {
+		var code exitCode
+		if errors.As(err, &code) { // persona exec: the command's own status
+			return int(code)
+		}
 		if errors.Is(err, context.Canceled) {
 			fmt.Fprintln(stderr, ui.Dim.Render("cancelled"))
 			return 130

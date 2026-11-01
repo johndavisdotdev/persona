@@ -49,6 +49,7 @@ type Identity struct {
 	MAC          string   `json:"mac"`
 	Hostname     string   `json:"hostname"`
 	Nameservers  []string `json:"nameservers"`
+	Search       []string `json:"search,omitempty"` // resolv.conf search domains
 	TimeUnixNano int64    `json:"time_unix_nano"`
 	Seed         []byte   `json:"seed"` // mixed into the guest RNG
 }
@@ -97,15 +98,44 @@ type Event struct {
 
 // Guest-initiated request kinds the host broker understands.
 const (
-	KindPush = "push" // body: null
-	KindPR   = "pr"   // body: PRRequest
+	KindPush   = "push"   // body: null or PushRequest
+	KindPR     = "pr"     // body: PRRequest
+	KindFetch  = "fetch"  // body: FetchRequest; answer: FetchResult
+	KindStatus = "status" // body: one status event (see persona-status); never answered
+	KindBeacon = "beacon" // body: a BrokerMessage from persona-beacon, protobuf JSON
 )
+
+// PushRequest asks the host to push the instance's branch. Force replaces
+// the branch's history (after a rebase) instead of fast-forwarding it.
+type PushRequest struct {
+	Force bool `json:"force,omitempty"`
+}
 
 // PRRequest asks the host to push the instance's branch and open a pull request.
 type PRRequest struct {
 	Title string `json:"title"`
 	Body  string `json:"body,omitempty"`
 	Draft bool   `json:"draft,omitempty"`
+	Force bool   `json:"force,omitempty"` // as in PushRequest
+}
+
+// FetchRequest asks the host for branches of its repository. The host
+// pushes each into the instance's repository as refs/remotes/host/<branch>.
+// No branches means the instance's base branch.
+type FetchRequest struct {
+	Branches []string `json:"branches,omitempty"`
+}
+
+// FetchResult is the broker's answer to fetch.
+type FetchResult struct {
+	Refs []FetchedRef `json:"refs"`
+}
+
+// FetchedRef is one branch fetch brought in.
+type FetchedRef struct {
+	Branch string `json:"branch"` // as asked, e.g. "main" or "origin/main"
+	Ref    string `json:"ref"`    // in the instance's repository, e.g. "host/main"
+	Commit string `json:"commit"`
 }
 
 // PushResult is the broker's answer to push and pr.

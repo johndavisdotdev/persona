@@ -3,9 +3,11 @@
 package guest
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -13,10 +15,50 @@ import (
 const (
 	stage      = "/run/stage"
 	overlayDev = "/dev/vdb"
+	// ext4 labels of the disks besides the root (see package microvm).
+	overlayLabel = "persona-overlay"
+	storeLabel   = "persona-store"
 )
 
+// ext4Label reads an ext4 filesystem's volume label from its superblock.
+func ext4Label(dev string) string {
+	f, err := os.Open(dev)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sb := make([]byte, 136)
+	if _, err := f.ReadAt(sb, 1024); err != nil || sb[0x38] != 0x53 || sb[0x39] != 0xef {
+		return ""
+	}
+	return string(bytes.TrimRight(sb[0x78:0x88], "\x00"))
+}
+
+// disks finds the VM's writable disk and store layers among /dev/vd[b-z].
+func disks() (overlay string, stores []string) {
+	for c := 'b'; c <= 'z'; c++ {
+		dev := "/dev/vd" + string(c)
+		if _, err := os.Stat(dev); err != nil {
+			continue
+		}
+		switch ext4Label(dev) {
+		case overlayLabel:
+			overlay = dev
+		case storeLabel:
+			stores = append(stores, dev)
+		}
+	}
+	if overlay == "" {
+		if _, err := os.Stat(overlayDev); err == nil && !strings.Contains(strings.Join(stores, " "), overlayDev) {
+			overlay = overlayDev // an unlabeled writable disk (older overlays)
+		}
+	}
+	return overlay, stores
+}
+
 // setupRoot pivots into an overlay of the read-only root image (lower) and
-// this VM's own disk (upper). Without a disk the upper layer is tmpfs.
+// this VM's own disk (upper), and mounts the store layers on /nix/store.
+// Without a disk the upper layer is tmpfs.
 func setupRoot() error {
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make / private: %w", err)
@@ -34,12 +76,24 @@ func setupRoot() error {
 	if err := unix.Mount("/", lower, "", unix.MS_BIND, ""); err != nil {
 		return fmt.Errorf("bind lower: %w", err)
 	}
-	if _, err := os.Stat(overlayDev); err == nil {
-		if err := unix.Mount(overlayDev, ovl, "ext4", unix.MS_NOATIME, ""); err != nil {
-			return fmt.Errorf("mount %s: %w", overlayDev, err)
+	overlay, stores := disks()
+	if overlay != "" {
+		if err := unix.Mount(overlay, ovl, "ext4", unix.MS_NOATIME, ""); err != nil {
+			return fmt.Errorf("mount %s: %w", overlay, err)
 		}
 	} else {
-		log.Printf("no %s: writes go to memory", overlayDev)
+		log.Printf("no writable disk: writes go to memory")
+	}
+	var layers []string
+	for i, dev := range stores {
+		dir := fmt.Sprintf("%s/store-%d", stage, i)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		if err := unix.Mount(dev, dir, "ext4", unix.MS_RDONLY|unix.MS_NOATIME, ""); err != nil {
+			return fmt.Errorf("mount store layer %s: %w", dev, err)
+		}
+		layers = append(layers, "/.oldroot"+dir) // where it is after the pivot
 	}
 	for _, d := range []string{ovl + "/upper", ovl + "/work"} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -60,8 +114,32 @@ func setupRoot() error {
 	if err := os.Chdir("/"); err != nil {
 		return err
 	}
-	// The overlay keeps its layers alive; the old tree can go.
+	if err := mountStore(layers); err != nil {
+		return err
+	}
+	// The overlays keep their layers alive; the old tree can go.
 	return unix.Unmount("/.oldroot", unix.MNT_DETACH)
+}
+
+// mountStore puts the store layers together on /nix/store, read-only.
+func mountStore(layers []string) error {
+	if len(layers) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll("/nix/store", 0o755); err != nil {
+		return err
+	}
+	if len(layers) == 1 {
+		if err := unix.Mount(layers[0], "/nix/store", "", unix.MS_BIND, ""); err != nil {
+			return fmt.Errorf("bind /nix/store: %w", err)
+		}
+		return unix.Mount("", "/nix/store", "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, "")
+	}
+	// An overlay of lower layers only is read-only.
+	if err := unix.Mount("overlay", "/nix/store", "overlay", unix.MS_RDONLY, "lowerdir="+strings.Join(layers, ":")); err != nil {
+		return fmt.Errorf("mount /nix/store: %w", err)
+	}
+	return nil
 }
 
 // mountSystem mounts the pseudo filesystems inside the (new) root.

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -19,14 +21,22 @@ import (
 
 func newEditCmd() *cobra.Command {
 	var spec, settings, noBuild, build bool
+	var file string
 	cmd := &cobra.Command{
 		Use:   "edit <name>",
-		Short: "Hand-edit a persona's Dockerfile, settings.json (--settings), or definition (--spec)",
-		Long: `A persona's image is defined by two generated files, which you can edit by hand:
+		Short: "Hand-edit a persona's flake.nix, setup scripts, settings.json, or definition (--spec)",
+		Long: `A persona's image is defined by generated files, which you can edit by hand:
 
-  Dockerfile      (default)      the exact image definition
-  settings.json   (--settings)   ~/.claude/settings.json: marketplaces, enabled
-                                 plugins (pre-installed at build), model, permissions…
+  flake.nix       (default)          the Nix base image: packages and toolchains
+  setup-root.sh   (--file setup-root.sh)
+  setup-user.sh   (--file setup-user.sh)
+                                     setup run in a container from the base image
+                                     (harness, plugins, tools Nix can't express)
+  settings.json   (--settings)       ~/.claude/settings.json: marketplaces, enabled
+                                     plugins (pre-installed at build), model, permissions…
+
+To change the built image by hand instead (interactive configuration,
+packages Nix lacks), use ` + "`persona customize`" + `.
 
 Hand-edited files are protected: ` + "`persona update`" + ` and base changes won't overwrite
 them without --force. With --spec, edits persona.yaml and regenerates whichever
@@ -46,9 +56,15 @@ rebuilt (with a prompt when interactive).`,
 			if err != nil {
 				return err
 			}
-			// Make sure generated files exist (e.g. personas created before settings.json existed).
-			for _, f := range []string{persona.DockerfilePath(p.Name), persona.SettingsPath(p.Name)} {
-				if _, err := os.Stat(f); os.IsNotExist(err) {
+			if p.Frozen() {
+				return persona.ErrFrozen(p)
+			}
+			if !slices.Contains(persona.EditableFiles, file) {
+				return fmt.Errorf("--file must be one of %s", strings.Join(persona.EditableFiles, ", "))
+			}
+			// Make sure generated files exist (e.g. personas from before Nix builds).
+			for _, f := range persona.EditableFiles {
+				if _, err := os.Stat(filepath.Join(persona.Dir(p.Name), f)); os.IsNotExist(err) {
 					if _, err := p.Generate(false); err != nil {
 						return err
 					}
@@ -56,7 +72,10 @@ rebuilt (with a prompt when interactive).`,
 				}
 			}
 
-			path, validate := persona.DockerfilePath(p.Name), func() error { return nil }
+			path, validate := filepath.Join(persona.Dir(p.Name), file), func() error { return nil }
+			if file == persona.FileSettings {
+				validate = func() error { return validateJSONFile(path) }
+			}
 			switch {
 			case spec:
 				path = persona.SpecPath(p.Name)
@@ -97,8 +116,9 @@ rebuilt (with a prompt when interactive).`,
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&spec, "spec", false, "edit persona.yaml instead of the Dockerfile")
-	cmd.Flags().BoolVar(&settings, "settings", false, "edit the persona's settings.json instead of the Dockerfile")
+	cmd.Flags().BoolVar(&spec, "spec", false, "edit persona.yaml instead of flake.nix")
+	cmd.Flags().BoolVar(&settings, "settings", false, "edit the persona's settings.json (same as --file settings.json)")
+	cmd.Flags().StringVar(&file, "file", persona.FileFlake, "generated file to edit: "+strings.Join(persona.EditableFiles, ", "))
 	cmd.Flags().BoolVar(&build, "build", false, "rebuild after editing without prompting")
 	cmd.Flags().BoolVar(&noBuild, "no-build", false, "do not rebuild after editing")
 	return cmd
@@ -174,10 +194,7 @@ func validateSpecFile(name string) (*persona.Persona, error) {
 	if p.Name != name {
 		return nil, fmt.Errorf("name must stay %q (rename by creating a new persona)", name)
 	}
-	if _, err := persona.RenderDockerfile(&p); err != nil {
-		return nil, err
-	}
-	if _, err := persona.RenderSettings(&p); err != nil {
+	if _, err := persona.Render(&p); err != nil {
 		return nil, err
 	}
 	return &p, nil
