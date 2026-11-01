@@ -53,6 +53,13 @@ type Runtime interface {
 	AttachCommand(ctx context.Context, name string) *exec.Cmd
 }
 
+// Preparer is a runtime that does per-image work ahead of time (the
+// firecracker runtime exports the image to a microVM disk), so spawning
+// right after a build doesn't wait for it.
+type Preparer interface {
+	Prepare(ctx context.Context, personaName, image string) error
+}
+
 // Current returns the configured runtime.
 func Current() Runtime {
 	if viper.GetString(config.KeyRuntime) == "firecracker" {

@@ -23,7 +23,13 @@ if [ "$1" = configure ]; then
 	if [ -d /run/systemd/system ]; then
 		systemctl daemon-reload
 		systemctl enable persona-netns.service >/dev/null 2>&1 || true
-		systemctl restart persona-netns.service || echo "persona: persona-netns.service failed to start; see: journalctl -u persona-netns" >&2
+		# Never restart it: stopping tears the namespace down, which would cut
+		# off running VMs. Refresh the rules in place instead (idempotent).
+		if systemctl is-active --quiet persona-netns.service; then
+			/usr/libexec/persona/persona-netns up >/dev/null || echo "persona: refreshing the network namespace failed" >&2
+		else
+			systemctl start persona-netns.service || echo "persona: persona-netns.service failed to start; see: journalctl -u persona-netns" >&2
+		fi
 	fi
 
 	[ -e /dev/kvm ] || echo "persona: /dev/kvm is missing; microVMs need KVM (enable virtualization, or set runtime: docker)" >&2

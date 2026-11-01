@@ -122,13 +122,24 @@ func TestVMRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// What `persona build` does after building the image.
+	tp := time.Now()
+	if err := v.Prepare(ctx, "tester", "persona-test-session"); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("prepared the microVM disk in %v", time.Since(tp).Round(time.Millisecond))
+
 	t0 := time.Now()
+	var spawnLog strings.Builder
 	name, err := v.Run(ctx, RunOptions{Persona: "tester", Instance: "t1", Image: "persona-test-session",
-		Workdir: filepath.Join(repo, "sub"), Env: []string{"PERSONA_TEST_SECRET"}})
+		Workdir: filepath.Join(repo, "sub"), Env: []string{"PERSONA_TEST_SECRET"}, Log: &spawnLog})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("spawned %s in %v", name, time.Since(t0).Round(time.Millisecond))
+	if strings.Contains(spawnLog.String(), "Exporting") {
+		t.Errorf("spawn exported the image although Prepare already had:\n%s", spawnLog.String())
+	}
 	rec, _ := loadRecord(name)
 	t.Cleanup(func() {
 		if t.Failed() {

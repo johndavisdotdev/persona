@@ -104,7 +104,24 @@ up() {
   echo "persona netns '$NS' up: bridge $BR ($BR_ADDR), NAT via $UPLINK"
 }
 
+# running_vms lists microVMs whose supervisors are alive.
+running_vms() {
+  local f pid
+  for f in /srv/jailer/persona-state/*.json; do
+    [ -e "$f" ] || continue
+    pid=$(grep -o '"pid":[0-9]*' "$f" | cut -d: -f2)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && basename "$f" .json
+  done
+}
+
 down() {
+  # Tearing down the namespace cuts running VMs off the network for good.
+  local vms
+  vms=$(running_vms)
+  if [ -n "$vms" ] && [ -z "${PERSONA_NETNS_FORCE:-}" ]; then
+    echo "persona netns '$NS' left up: microVMs are running ($(echo $vms)); stop them first or set PERSONA_NETNS_FORCE=1" >&2
+    return 0
+  fi
   drop_chain "$IPT" nat POSTROUTING PERSONA-NAT
   drop_chain "$IPT" filter FORWARD PERSONA-FWD
   drop_chain "$IPT" filter INPUT PERSONA-IN

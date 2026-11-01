@@ -49,6 +49,14 @@ func buildImage(ctx context.Context, name string, noCache bool, out io.Writer) e
 		return err
 	}
 	ui.Success(out, fmt.Sprintf("Built %s in %s", persona.ImageFor(name), time.Since(start).Round(time.Second)))
+	if p, ok := instance.Current().(instance.Preparer); ok {
+		start = time.Now()
+		if err := p.Prepare(ctx, name, persona.ImageFor(name)); err != nil {
+			ui.Warning(out, "microVM disk not prepared ("+err.Error()+"); spawn will create it")
+		} else {
+			ui.Success(out, fmt.Sprintf("Prepared the microVM disk in %s", time.Since(start).Round(100*time.Millisecond)))
+		}
+	}
 	return nil
 }
 

@@ -286,6 +286,20 @@ func (v *VM) rootfs(ctx context.Context, personaName, image, imageID string, log
 	return path, nil
 }
 
+// Prepare exports image's microVM disk and creates the blank overlay disk,
+// unless they already exist. Spawn does the same on a cache miss.
+func (v *VM) Prepare(ctx context.Context, personaName, image string) error {
+	imageID, _, err := v.inspect(ctx, image)
+	if err != nil {
+		return err
+	}
+	if _, err := v.rootfs(ctx, personaName, image, imageID, io.Discard); err != nil {
+		return err
+	}
+	_, err = v.overlay(ctx)
+	return err
+}
+
 // overlay returns the blank writable-layer template persona-vm copies per VM.
 func (v *VM) overlay(ctx context.Context) (string, error) {
 	path := filepath.Join(config.VMDir(), fmt.Sprintf("overlay-%dg.ext4", v.DiskGiB))
