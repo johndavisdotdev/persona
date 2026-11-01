@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "USE_BUILTIN_RIPGREP": "0",
+    "IS_SANDBOX": "1"
+  },
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "model": "opus",
+  "enabledPlugins": {
+    "prismantis@prismantis": true
+  },
+  "extraKnownMarketplaces": {
+    "rhiannon-ai": {
+      "source": {
+        "source": "git",
+        "url": "https://github.com/rhiannon-ai-llc/agent-plugin.git"
+      }
+    },
+    "prismantis": {
+      "source": {
+        "source": "github",
+        "repo": "NahumLitvin/prismantis"
+      }
+    }
+  },
+  "modelSettings": {
+    "claude-opus-5-5": {
+      "effortLevel": "medium"
+    }
+  },
+  "tui": "fullscreen",
+  "skipDangerousModePermissionPrompt": true,
+  "skipWorkflowUsageWarning": true,
+  "theme": "dark",
+  "inputNeededNotifEnabled": true,
+  "agentPushNotifEnabled": true,
+  "skipAutoPermissionPrompt": true,
+  "pluginConfigs": {
+    "prismantis@prismantis": {
+      "options": {
+        "theme": "one-dark",
+        "tableStyle": "minimal",
+        "taskStyle": "checks",
+        "headingStyle": "banner",
+        "copyButtonStyle": "inline",
+        "promptStyle": "bubble",
+        "clock": "off",
+        "toolStyle": "chat",
+        "toolOutput": "full",
+        "diffStyle": "card",
+        "pieStyle": "round"
+      }
+    }
+  }
+}
