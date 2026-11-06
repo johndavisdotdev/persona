@@ -1,5 +1,7 @@
 # persona
 
+![](https://github.com/johndavisdotdev/persona/raw/refs/heads/main/promo.mp4)
+
 Build, spawn, and manage **coding-agent personas**: minimal [Nix](https://nixos.org)-built images running a coding agent (Claude
 Code by default, or the [pi](https://pi.dev) harness), with the packages, skills, MCP servers and language
 toolchains a role needs already set up.
