@@ -16,6 +16,10 @@ func TestHarnessDefaultsToClaude(t *testing.T) {
 		!strings.Contains(d.Files[FileFlake], "PERSONA_HARNESS=claude") {
 		t.Error("the default harness should be Claude Code")
 	}
+	// --channels is variadic, so the prompt must come after "--".
+	if !strings.Contains(d.Support["bin/persona-entrypoint"], `claude ${PERSONA_CLAUDE_ARGS:-} -- "$PERSONA_PROMPT"`) {
+		t.Error("the entrypoint must end Claude Code's options before the prompt")
+	}
 }
 
 func TestPiHarnessWithPackages(t *testing.T) {
