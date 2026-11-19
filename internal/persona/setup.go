@@ -413,7 +413,9 @@ pi)
     PERSONA_CLAUDE_ARGS="--channels plugin:beacon@persona ${PERSONA_CLAUDE_ARGS:-}"
     export PERSONA_CLAUDE_ARGS
   fi
-  agent='if [ -n "${PERSONA_PROMPT:-}" ]; then claude ${PERSONA_CLAUDE_ARGS:-} "$PERSONA_PROMPT"; else claude ${PERSONA_CLAUDE_ARGS:-}; fi' ;;
+  # "--" ends the options: --channels takes several values and would read the
+  # prompt as another channel entry.
+  agent='if [ -n "${PERSONA_PROMPT:-}" ]; then claude ${PERSONA_CLAUDE_ARGS:-} -- "$PERSONA_PROMPT"; else claude ${PERSONA_CLAUDE_ARGS:-}; fi' ;;
 esac
 
 tmux -u new-session -d -s ` + SessionName + ` -x "${PERSONA_COLS:-200}" -y "${PERSONA_ROWS:-50}" \
